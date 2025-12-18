@@ -29,6 +29,7 @@ show_help() {
 选项:
     -b, --branch <分支>  指定源仓库的分支 (默认: 当前分支)
     -t, --target-branch <分支>  指定目标仓库的分支 (默认: 当前分支)
+    -c, --create-branch  如果目标分支不存在则自动创建
     -n, --no-merge       排除通过 merge 引入的变更，只同步直接提交
     -d, --dry-run        仅显示将要进行的操作，不实际执行
     -v, --verbose        显示详细输出
@@ -38,7 +39,7 @@ show_help() {
 示例:
     $(basename "$0") /path/to/funding funding-common /path/to/funding-common abc123
     $(basename "$0") -n /path/to/funding funding-common /path/to/funding-common abc123
-    $(basename "$0") -b feature/xxx -t feature/xxx /path/to/funding funding-common /path/to/funding-common abc123
+    $(basename "$0") -b feature/xxx -t feature/xxx -c /path/to/funding funding-common /path/to/funding-common abc123
 
 EOF
 }
@@ -65,6 +66,7 @@ NO_MERGE=false
 DRY_RUN=false
 VERBOSE=false
 YES=false
+CREATE_BRANCH=false
 SOURCE_BRANCH=""
 TARGET_BRANCH=""
 
@@ -78,6 +80,10 @@ while [[ $# -gt 0 ]]; do
         -t|--target-branch)
             TARGET_BRANCH="$2"
             shift 2
+            ;;
+        -c|--create-branch)
+            CREATE_BRANCH=true
+            shift
             ;;
         -n|--no-merge)
             NO_MERGE=true
@@ -170,14 +176,21 @@ TARGET_ORIGINAL_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 
 if [[ -n "$TARGET_BRANCH" ]]; then
     if ! git rev-parse --verify "$TARGET_BRANCH" > /dev/null 2>&1; then
-        log_error "目标仓库中不存在分支: $TARGET_BRANCH"
-        # 恢复源仓库原分支
-        cd "$SOURCE_REPO"
-        [[ "$SOURCE_BRANCH" != "$SOURCE_ORIGINAL_BRANCH" ]] && git checkout "$SOURCE_ORIGINAL_BRANCH" --quiet
-        exit 1
+        if $CREATE_BRANCH; then
+            log_info "目标分支不存在，正在创建: $TARGET_BRANCH"
+            git checkout -b "$TARGET_BRANCH" --quiet
+        else
+            log_error "目标仓库中不存在分支: $TARGET_BRANCH"
+            log_info "提示: 使用 -c 选项可自动创建分支"
+            # 恢复源仓库原分支
+            cd "$SOURCE_REPO"
+            [[ "$SOURCE_BRANCH" != "$SOURCE_ORIGINAL_BRANCH" ]] && git checkout "$SOURCE_ORIGINAL_BRANCH" --quiet
+            exit 1
+        fi
+    else
+        log_info "切换目标仓库到分支: $TARGET_BRANCH"
+        git checkout "$TARGET_BRANCH" --quiet
     fi
-    log_info "切换目标仓库到分支: $TARGET_BRANCH"
-    git checkout "$TARGET_BRANCH" --quiet
 else
     TARGET_BRANCH="$TARGET_ORIGINAL_BRANCH"
 fi
