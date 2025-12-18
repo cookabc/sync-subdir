@@ -24,12 +24,13 @@ show_help() {
     源仓库        源 Git 仓库路径
     子目录        源仓库中要同步的子目录名称
     目标仓库      目标 Git 仓库路径
-    起始commit    起始 commit hash (不包含此 commit 的变更)
+    起始commit    起始 commit hash
 
 选项:
     -b, --branch <分支>  指定源仓库的分支 (默认: 当前分支)
     -t, --target-branch <分支>  指定目标仓库的分支 (默认: 当前分支)
     -c, --create-branch  如果目标分支不存在则自动创建
+    -i, --include-start  包含起始 commit 的变更 (默认不包含)
     -n, --no-merge       排除通过 merge 引入的变更，只同步直接提交
     -d, --dry-run        仅显示将要进行的操作，不实际执行
     -v, --verbose        显示详细输出
@@ -67,6 +68,7 @@ DRY_RUN=false
 VERBOSE=false
 YES=false
 CREATE_BRANCH=false
+INCLUDE_START=false
 SOURCE_BRANCH=""
 TARGET_BRANCH=""
 
@@ -83,6 +85,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -c|--create-branch)
             CREATE_BRANCH=true
+            shift
+            ;;
+        -i|--include-start)
+            INCLUDE_START=true
             shift
             ;;
         -n|--no-merge)
@@ -204,13 +210,23 @@ log_info "子目录: $SUBDIR"
 log_info "目标仓库: $TARGET_REPO"
 log_info "目标分支: $TARGET_BRANCH"
 log_info "起始 commit: $START_COMMIT"
+log_info "包含起始 commit: $INCLUDE_START"
 log_info "排除 merge: $NO_MERGE"
 echo ""
+
+# 设置 commit 范围
+if $INCLUDE_START; then
+    # 包含起始 commit: 使用 commit^ 作为起点
+    COMMIT_RANGE="${START_COMMIT}^..HEAD"
+else
+    # 不包含起始 commit
+    COMMIT_RANGE="${START_COMMIT}..HEAD"
+fi
 
 # 获取所有变更的文件
 log_info "正在分析变更..."
 
-ALL_CHANGED_FILES=$(git diff --name-only "$START_COMMIT..HEAD" -- "$SUBDIR/")
+ALL_CHANGED_FILES=$(git diff --name-only "$COMMIT_RANGE" -- "$SUBDIR/")
 
 if [[ -z "$ALL_CHANGED_FILES" ]]; then
     log_warn "没有发现任何变更"
@@ -218,8 +234,8 @@ if [[ -z "$ALL_CHANGED_FILES" ]]; then
 fi
 
 # 统计提交
-TOTAL_COMMITS=$(git log --oneline "$START_COMMIT..HEAD" -- "$SUBDIR/" | wc -l | tr -d ' ')
-MERGE_COMMITS=$(git log --oneline --merges "$START_COMMIT..HEAD" -- "$SUBDIR/" | wc -l | tr -d ' ')
+TOTAL_COMMITS=$(git log --oneline "$COMMIT_RANGE" -- "$SUBDIR/" | wc -l | tr -d ' ')
+MERGE_COMMITS=$(git log --oneline --merges "$COMMIT_RANGE" -- "$SUBDIR/" | wc -l | tr -d ' ')
 DIRECT_COMMITS=$((TOTAL_COMMITS - MERGE_COMMITS))
 
 log_info "总提交数: $TOTAL_COMMITS (直接提交: $DIRECT_COMMITS, Merge: $MERGE_COMMITS)"
@@ -228,8 +244,8 @@ if $NO_MERGE && [[ $MERGE_COMMITS -gt 0 ]]; then
     log_info "检测到 $MERGE_COMMITS 个 merge 提交，将排除其引入的变更"
     
     # 获取通过 merge 引入的提交
-    DIRECT_COMMIT_HASHES=$(git log --oneline --no-merges --first-parent "$START_COMMIT..HEAD" -- "$SUBDIR/" | cut -d' ' -f1)
-    ALL_COMMIT_HASHES=$(git log --oneline --no-merges "$START_COMMIT..HEAD" -- "$SUBDIR/" | cut -d' ' -f1)
+    DIRECT_COMMIT_HASHES=$(git log --oneline --no-merges --first-parent "$COMMIT_RANGE" -- "$SUBDIR/" | cut -d' ' -f1)
+    ALL_COMMIT_HASHES=$(git log --oneline --no-merges "$COMMIT_RANGE" -- "$SUBDIR/" | cut -d' ' -f1)
     
     # 找出通过 merge 引入的提交
     MERGE_INTRODUCED_COMMITS=""
@@ -243,7 +259,7 @@ if $NO_MERGE && [[ $MERGE_COMMITS -gt 0 ]]; then
     MERGE_ONLY_FILES=""
     for file in $ALL_CHANGED_FILES; do
         # 检查这个文件是否在 first-parent 提交中有变更
-        FIRST_PARENT_CHANGES=$(git log --oneline --no-merges --first-parent "$START_COMMIT..HEAD" -- "$file" | wc -l | tr -d ' ')
+        FIRST_PARENT_CHANGES=$(git log --oneline --no-merges --first-parent "$COMMIT_RANGE" -- "$file" | wc -l | tr -d ' ')
         if [[ $FIRST_PARENT_CHANGES -eq 0 ]]; then
             MERGE_ONLY_FILES="$MERGE_ONLY_FILES $file"
         fi
@@ -264,7 +280,7 @@ FILES_TO_RESTORE=""
 
 for file in $ALL_CHANGED_FILES; do
     if $NO_MERGE; then
-        FIRST_PARENT_CHANGES=$(git log --oneline --no-merges --first-parent "$START_COMMIT..HEAD" -- "$file" | wc -l | tr -d ' ')
+        FIRST_PARENT_CHANGES=$(git log --oneline --no-merges --first-parent "$COMMIT_RANGE" -- "$file" | wc -l | tr -d ' ')
         if [[ $FIRST_PARENT_CHANGES -gt 0 ]]; then
             FILES_TO_SYNC="$FILES_TO_SYNC $file"
         else
@@ -282,7 +298,7 @@ log_info "将同步 $SYNC_COUNT 个文件:"
 if $VERBOSE; then
     for file in $FILES_TO_SYNC; do
         # 检查是新增还是修改
-        STATUS=$(git diff --name-status "$START_COMMIT..HEAD" -- "$file" | cut -f1)
+        STATUS=$(git diff --name-status "$COMMIT_RANGE" -- "$file" | cut -f1)
         case $STATUS in
             A) echo -e "  ${GREEN}[新增]${NC} $file" ;;
             M) echo -e "  ${YELLOW}[修改]${NC} $file" ;;
