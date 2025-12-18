@@ -27,14 +27,18 @@ show_help() {
     起始commit    起始 commit hash (不包含此 commit 的变更)
 
 选项:
-    -n, --no-merge     排除通过 merge 引入的变更，只同步直接提交
-    -d, --dry-run      仅显示将要进行的操作，不实际执行
-    -v, --verbose      显示详细输出
-    -h, --help         显示此帮助信息
+    -b, --branch <分支>  指定源仓库的分支 (默认: 当前分支)
+    -t, --target-branch <分支>  指定目标仓库的分支 (默认: 当前分支)
+    -n, --no-merge       排除通过 merge 引入的变更，只同步直接提交
+    -d, --dry-run        仅显示将要进行的操作，不实际执行
+    -v, --verbose        显示详细输出
+    -y, --yes            跳过确认提示，直接执行
+    -h, --help           显示此帮助信息
 
 示例:
     $(basename "$0") /path/to/funding funding-common /path/to/funding-common abc123
     $(basename "$0") -n /path/to/funding funding-common /path/to/funding-common abc123
+    $(basename "$0") -b feature/xxx -t feature/xxx /path/to/funding funding-common /path/to/funding-common abc123
 
 EOF
 }
@@ -60,10 +64,21 @@ log_error() {
 NO_MERGE=false
 DRY_RUN=false
 VERBOSE=false
+YES=false
+SOURCE_BRANCH=""
+TARGET_BRANCH=""
 
 # 解析选项
 while [[ $# -gt 0 ]]; do
     case $1 in
+        -b|--branch)
+            SOURCE_BRANCH="$2"
+            shift 2
+            ;;
+        -t|--target-branch)
+            TARGET_BRANCH="$2"
+            shift 2
+            ;;
         -n|--no-merge)
             NO_MERGE=true
             shift
@@ -74,6 +89,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -v|--verbose)
             VERBOSE=true
+            shift
+            ;;
+        -y|--yes)
+            YES=true
             shift
             ;;
         -h|--help)
@@ -119,16 +138,58 @@ if [[ ! -d "$SOURCE_REPO/$SUBDIR" ]]; then
     exit 1
 fi
 
-# 验证 commit
+# 切换到源仓库
 cd "$SOURCE_REPO"
+
+# 保存源仓库当前分支
+SOURCE_ORIGINAL_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+# 如果指定了源分支，切换到该分支
+if [[ -n "$SOURCE_BRANCH" ]]; then
+    if ! git rev-parse --verify "$SOURCE_BRANCH" > /dev/null 2>&1; then
+        log_error "源仓库中不存在分支: $SOURCE_BRANCH"
+        exit 1
+    fi
+    log_info "切换源仓库到分支: $SOURCE_BRANCH"
+    git checkout "$SOURCE_BRANCH" --quiet
+else
+    SOURCE_BRANCH="$SOURCE_ORIGINAL_BRANCH"
+fi
+
+# 验证 commit
 if ! git rev-parse --verify "$START_COMMIT" > /dev/null 2>&1; then
     log_error "无效的 commit: $START_COMMIT"
+    # 恢复原分支
+    [[ "$SOURCE_BRANCH" != "$SOURCE_ORIGINAL_BRANCH" ]] && git checkout "$SOURCE_ORIGINAL_BRANCH" --quiet
     exit 1
 fi
 
+# 切换到目标仓库检查分支
+cd "$TARGET_REPO"
+TARGET_ORIGINAL_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+if [[ -n "$TARGET_BRANCH" ]]; then
+    if ! git rev-parse --verify "$TARGET_BRANCH" > /dev/null 2>&1; then
+        log_error "目标仓库中不存在分支: $TARGET_BRANCH"
+        # 恢复源仓库原分支
+        cd "$SOURCE_REPO"
+        [[ "$SOURCE_BRANCH" != "$SOURCE_ORIGINAL_BRANCH" ]] && git checkout "$SOURCE_ORIGINAL_BRANCH" --quiet
+        exit 1
+    fi
+    log_info "切换目标仓库到分支: $TARGET_BRANCH"
+    git checkout "$TARGET_BRANCH" --quiet
+else
+    TARGET_BRANCH="$TARGET_ORIGINAL_BRANCH"
+fi
+
+# 切回源仓库进行后续操作
+cd "$SOURCE_REPO"
+
 log_info "源仓库: $SOURCE_REPO"
+log_info "源分支: $SOURCE_BRANCH"
 log_info "子目录: $SUBDIR"
 log_info "目标仓库: $TARGET_REPO"
+log_info "目标分支: $TARGET_BRANCH"
 log_info "起始 commit: $START_COMMIT"
 log_info "排除 merge: $NO_MERGE"
 echo ""
@@ -227,15 +288,27 @@ echo ""
 # Dry run 模式
 if $DRY_RUN; then
     log_warn "Dry-run 模式，不执行实际操作"
+    # 恢复原分支
+    cd "$SOURCE_REPO"
+    [[ "$SOURCE_BRANCH" != "$SOURCE_ORIGINAL_BRANCH" ]] && git checkout "$SOURCE_ORIGINAL_BRANCH" --quiet
+    cd "$TARGET_REPO"
+    [[ "$TARGET_BRANCH" != "$TARGET_ORIGINAL_BRANCH" ]] && git checkout "$TARGET_ORIGINAL_BRANCH" --quiet
     exit 0
 fi
 
 # 确认执行
-read -p "是否继续? [y/N] " -n 1 -r
-echo ""
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    log_warn "操作已取消"
-    exit 0
+if ! $YES; then
+    read -p "是否继续? [y/N] " -n 1 -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_warn "操作已取消"
+        # 恢复原分支
+        cd "$SOURCE_REPO"
+        [[ "$SOURCE_BRANCH" != "$SOURCE_ORIGINAL_BRANCH" ]] && git checkout "$SOURCE_ORIGINAL_BRANCH" --quiet
+        cd "$TARGET_REPO"
+        [[ "$TARGET_BRANCH" != "$TARGET_ORIGINAL_BRANCH" ]] && git checkout "$TARGET_ORIGINAL_BRANCH" --quiet
+        exit 0
+    fi
 fi
 
 # 执行同步
@@ -299,4 +372,11 @@ echo ""
 log_info "目标仓库变更状态:"
 cd "$TARGET_REPO"
 git status --short
+
+# 恢复源仓库原分支
+cd "$SOURCE_REPO"
+if [[ "$SOURCE_BRANCH" != "$SOURCE_ORIGINAL_BRANCH" ]]; then
+    log_info "恢复源仓库到原分支: $SOURCE_ORIGINAL_BRANCH"
+    git checkout "$SOURCE_ORIGINAL_BRANCH" --quiet
+fi
 
