@@ -2,7 +2,7 @@
 
 开发工具集合
 
-## sync-subdir-changes.sh
+## sync-subdir.sh
 
 子目录变更同步工具 - 将源仓库中某个子目录的变更同步到独立的目标仓库。
 
@@ -13,15 +13,15 @@
 ### 安装
 
 ```bash
-chmod +x sync-subdir-changes.sh
-# 可选: 添加到 PATH 或创建别名
-alias sync-subdir='/path/to/sync-subdir-changes.sh'
+chmod +x sync-subdir.sh
+# 可选: 添加到 PATH
+ln -s /path/to/sync-subdir.sh /usr/local/bin/sync-subdir
 ```
 
 ### 基本用法
 
 ```bash
-./sync-subdir-changes.sh <源仓库> <子目录> <目标仓库> <起始commit>
+sync-subdir.sh <源仓库> <子目录> <目标仓库> <起始commit>
 ```
 
 ### 参数说明
@@ -68,19 +68,19 @@ alias sync-subdir='/path/to/sync-subdir-changes.sh'
 
 ```bash
 # 基本使用
-./sync-subdir-changes.sh ~/repos/monorepo submodule ~/repos/submodule abc123
+sync-subdir.sh ~/repos/monorepo submodule ~/repos/submodule abc123
 
 # 指定分支
-./sync-subdir-changes.sh -b feature/x ~/repos/monorepo submodule ~/repos/submodule abc123
+sync-subdir.sh -b feature/x ~/repos/monorepo submodule ~/repos/submodule abc123
 
 # 排除 merge 提交，详细输出
-./sync-subdir-changes.sh -n -v ~/repos/monorepo submodule ~/repos/submodule abc123
+sync-subdir.sh -n -v ~/repos/monorepo submodule ~/repos/submodule abc123
 
 # 预览模式
-./sync-subdir-changes.sh -d ~/repos/monorepo submodule ~/repos/submodule abc123
+sync-subdir.sh -d ~/repos/monorepo submodule ~/repos/submodule abc123
 
 # 非交互式执行
-./sync-subdir-changes.sh -y ~/repos/monorepo submodule ~/repos/submodule abc123
+sync-subdir.sh -y ~/repos/monorepo submodule ~/repos/submodule abc123
 ```
 
 ### 工作流程
