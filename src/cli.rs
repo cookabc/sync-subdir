@@ -18,7 +18,6 @@ pub struct Config {
     pub auto_stash: Option<bool>,
     pub dry_run: bool,
     pub verbose: bool,
-    pub yes: bool,
 }
 
 impl Config {
@@ -54,7 +53,6 @@ impl Config {
             auto_stash: matches.get_flag("stash").then_some(true),
             dry_run: matches.get_flag("dry_run"),
             verbose: matches.get_flag("verbose"),
-            yes: matches.get_flag("yes"),
         })
     }
 
@@ -186,13 +184,6 @@ pub fn build_cli() -> Command {
                 .long("verbose")
                 .short('v')
                 .help("详细输出")
-                .action(clap::ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("yes")
-                .long("yes")
-                .short('y')
-                .help("跳过确认，使用默认值")
                 .action(clap::ArgAction::SetTrue),
         )
         .after_help(
