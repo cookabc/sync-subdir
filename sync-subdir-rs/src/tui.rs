@@ -1,0 +1,508 @@
+use anyhow::Result;
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    widgets::{
+        Block, Borders, Clear, Gauge, ListState, Paragraph, Wrap,
+        Table, Row, Cell
+    },
+    Frame, Terminal,
+};
+use std::io::stdout;
+use std::time::{Duration, Instant};
+
+use crate::cli::Config;
+use crate::git::{FileChange, FileStatus};
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AppState {
+    ConfigReview,
+    FileSelection,
+    Progress,
+    Confirmation,
+    Completed,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum ConfirmationAction {
+    CreateBranch,
+    StashChanges,
+    IncludeStart,
+    ExcludeMerges,
+    SyncDelete,
+    ExecuteSync,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct App {
+    pub state: AppState,
+    pub config: Config,
+    pub file_changes: Vec<FileChange>,
+    pub selected_files: Vec<bool>,
+    pub current_confirmation: Option<ConfirmationAction>,
+    pub progress: f64,
+    pub status_message: String,
+    pub current_tab: usize,
+    pub list_state: ListState,
+    pub should_quit: bool,
+    pub confirmation_result: Option<bool>,
+    pub start_time: Instant,
+    pub end_time: Option<Instant>,
+    pub loaded_changes: bool,
+}
+
+impl App {
+    pub fn new(config: Config) -> Self {
+        Self {
+            state: AppState::ConfigReview,
+            config,
+            file_changes: Vec::new(),
+            selected_files: Vec::new(),
+            current_confirmation: None,
+            progress: 0.0,
+            status_message: String::new(),
+            current_tab: 0,
+            list_state: ListState::default(),
+            should_quit: false,
+            confirmation_result: None,
+            start_time: Instant::now(),
+            end_time: None,
+            loaded_changes: false,
+        }
+    }
+
+    pub fn set_file_changes(&mut self, changes: Vec<FileChange>) {
+        let count = changes.len();
+        self.file_changes = changes;
+        self.selected_files = vec![true; count];
+    }
+
+    pub fn next(&mut self) {
+        let i = match self.list_state.selected() {
+            Some(i) => {
+                if i >= self.file_changes.len() - 1 {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.list_state.select(Some(i));
+    }
+
+    pub fn previous(&mut self) {
+        let i = match self.list_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.file_changes.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.list_state.select(Some(i));
+    }
+
+    pub fn toggle_file_selection(&mut self) {
+        if let Some(i) = self.list_state.selected() {
+            if i < self.selected_files.len() {
+                self.selected_files[i] = !self.selected_files[i];
+            }
+        }
+    }
+
+    pub fn select_all(&mut self) {
+        self.selected_files.fill(true);
+    }
+
+    pub fn deselect_all(&mut self) {
+        self.selected_files.fill(false);
+    }
+
+    pub fn get_selected_count(&self) -> usize {
+        self.selected_files.iter().filter(|&&selected| selected).count()
+    }
+}
+
+pub struct TuiManager {
+    terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
+}
+
+impl TuiManager {
+    pub fn new() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = stdout();
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend)?;
+        Ok(Self { terminal })
+    }
+
+    pub fn draw(&mut self, app: &App) -> Result<()> {
+        self.terminal.draw(|f| {
+            match app.state {
+                AppState::ConfigReview => Self::draw_config_review(f, app),
+                AppState::FileSelection => Self::draw_file_selection(f, app),
+                AppState::Progress => Self::draw_progress(f, app),
+                AppState::Confirmation => Self::draw_confirmation(f, app),
+                AppState::Completed => Self::draw_completed(f, app),
+            }
+        })?;
+        Ok(())
+    }
+
+    fn draw_config_review(f: &mut Frame, app: &App) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(3),
+            ])
+            .split(f.size());
+
+        // Title
+        let title = Paragraph::new("配置审查")
+            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .block(Block::default().borders(Borders::ALL))
+            .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(title, chunks[0]);
+
+        // Configuration table
+        let config_rows = vec![
+            Row::new(vec![
+                Cell::from("源仓库"),
+                Cell::from(app.config.source_repo.to_string_lossy()),
+            ]),
+            Row::new(vec![
+                Cell::from("目标仓库"),
+                Cell::from(app.config.target_repo.to_string_lossy()),
+            ]),
+            Row::new(vec![
+                Cell::from("子目录"),
+                Cell::from(app.config.subdir.clone()),
+            ]),
+            Row::new(vec![
+                Cell::from("起始 Commit"),
+                Cell::from(app.config.start_commit.clone()),
+            ]),
+            Row::new(vec![
+                Cell::from("结束 Commit"),
+                Cell::from(app.config.end_commit.clone().unwrap_or_else(|| "HEAD".to_string())),
+            ]),
+        ];
+
+        let table = Table::new(config_rows)
+            .widths(&[Constraint::Length(15), Constraint::Percentage(80)])
+            .block(Block::default().borders(Borders::ALL).title("同步配置"))
+            .style(Style::default().fg(Color::White));
+        f.render_widget(table, chunks[1]);
+
+        // Instructions
+        let instructions = Paragraph::new("按 Enter 继续 | 按 q 退出")
+            .style(Style::default().fg(Color::Gray))
+            .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(instructions, chunks[2]);
+    }
+
+    fn draw_file_selection(f: &mut Frame, app: &App) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(10),  // Reduced minimum height to give more space to content
+                Constraint::Length(3),
+            ])
+            .split(f.size());
+
+        // Header with stats
+        let header_text = format!(
+            "文件列表 (总计: {}, 已选择: {})",
+            app.file_changes.len(),
+            app.get_selected_count()
+        );
+        let header = Paragraph::new(header_text)
+            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .block(Block::default().borders(Borders::ALL));
+        f.render_widget(header, chunks[0]);
+
+        // File list - Render with unlimited width to show full paths
+        for (i, change) in app.file_changes.iter().enumerate() {
+            let status_symbol = match change.status {
+                FileStatus::Added => "[+]",
+                FileStatus::Modified => "[~]",
+                FileStatus::Deleted => "[-]",
+                FileStatus::Renamed => "[→]",
+                FileStatus::TypeChanged => "[T]",
+            };
+
+            let selected_symbol = if app.selected_files[i] { "✓" } else { " " };
+
+            let color = match change.status {
+                FileStatus::Added => Color::Green,
+                FileStatus::Modified => Color::Yellow,
+                FileStatus::Deleted => Color::Red,
+                FileStatus::Renamed => Color::Blue,
+                FileStatus::TypeChanged => Color::Magenta,
+            };
+
+            let content = format!("{} {} {}", selected_symbol, status_symbol, change.path);
+
+            // Create a paragraph for each line with unlimited width
+            let y_pos = chunks[1].y + 1 + i as u16;
+            if y_pos < chunks[1].y + chunks[1].height - 1 {
+                // Create an area that extends beyond the visible bounds
+                let line_area = Rect {
+                    x: chunks[1].x + 1,
+                    y: y_pos,
+                    width: chunks[1].width.saturating_sub(2),  // Use available width minus borders
+                    height: 1,
+                };
+
+                let style = if Some(i) == app.list_state.selected() {
+                    Style::default().bg(Color::DarkGray).fg(color)
+                } else {
+                    Style::default().fg(color)
+                };
+
+                let line_paragraph = Paragraph::new(content)
+                    .style(style)
+                    .wrap(Wrap { trim: false });  // Don't trim, let it extend
+
+                f.render_widget(line_paragraph, line_area);
+            }
+        }
+
+        // Draw border around the file list area
+        let border = Block::default().borders(Borders::ALL);
+        f.render_widget(border, chunks[1]);
+
+        // Instructions
+        let instructions = Paragraph::new(
+            "↑/↓: 导航 | Space: 选择/取消 | a: 全选 | A: 取消全选 | Enter: 继续 | q: 退出"
+        )
+        .style(Style::default().fg(Color::Gray))
+        .wrap(Wrap { trim: true });
+        f.render_widget(instructions, chunks[2]);
+    }
+
+    fn draw_progress(f: &mut Frame, app: &App) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Min(5),
+            ])
+            .split(f.size());
+
+        // Title
+        let title = Paragraph::new("同步进度")
+            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .block(Block::default().borders(Borders::ALL))
+            .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(title, chunks[0]);
+
+        // Progress bar
+        let gauge = Gauge::default()
+            .block(Block::default().borders(Borders::ALL).title("进度"))
+            .gauge_style(Style::default().fg(Color::Green).bg(Color::Gray))
+            .percent((app.progress * 100.0) as u16);
+        f.render_widget(gauge, chunks[1]);
+
+        // Status message
+        let status = Paragraph::new(app.status_message.clone())
+            .style(Style::default().fg(Color::White))
+            .block(Block::default().borders(Borders::ALL).title("当前操作"))
+            .wrap(Wrap { trim: true });
+        f.render_widget(status, chunks[2]);
+    }
+
+    fn draw_confirmation(f: &mut Frame, app: &App) {
+        // Darken the background
+        f.render_widget(Clear, f.size());
+
+        let popup_area = centered_rect(60, 20, f.size());
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(3),
+            ])
+            .split(popup_area);
+
+        let confirmation_text = match app.current_confirmation {
+            Some(ConfirmationAction::CreateBranch) => "是否创建新分支?",
+            Some(ConfirmationAction::StashChanges) => "是否自动 Stash 变更?",
+            Some(ConfirmationAction::IncludeStart) => "是否包含起始 commit 的变更?",
+            Some(ConfirmationAction::ExcludeMerges) => "是否排除 merge 引入的变更?",
+            Some(ConfirmationAction::SyncDelete) => "是否同步删除操作?",
+            Some(ConfirmationAction::ExecuteSync) => "是否执行同步?",
+            None => "确认操作?",
+        };
+
+        let title = Paragraph::new("确认")
+            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+            .block(Block::default().borders(Borders::ALL))
+            .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(title, chunks[0]);
+
+        let message = Paragraph::new(confirmation_text)
+            .style(Style::default().fg(Color::White))
+            .block(Block::default().borders(Borders::ALL))
+            .alignment(ratatui::layout::Alignment::Center)
+            .wrap(Wrap { trim: true });
+        f.render_widget(message, chunks[1]);
+
+        let instructions = Paragraph::new("Y: 是 | N: 否")
+            .style(Style::default().fg(Color::Gray))
+            .block(Block::default().borders(Borders::ALL))
+            .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(instructions, chunks[2]);
+    }
+
+    fn draw_completed(f: &mut Frame, app: &App) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(10),
+                Constraint::Length(3),
+            ])
+            .split(f.size());
+
+        // Title
+        let title = Paragraph::new("同步完成!")
+            .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+            .block(Block::default().borders(Borders::ALL))
+            .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(title, chunks[0]);
+
+        // Summary
+        let elapsed = if let Some(end) = app.end_time {
+            end.duration_since(app.start_time)
+        } else {
+            app.start_time.elapsed()
+        };
+        
+        let summary_text = format!(
+            "同步完成!\n\n状态消息: {}\n\n用时: {:.2} 秒\n\n按 Enter 退出",
+            app.status_message,
+            elapsed.as_secs_f32()
+        );
+
+        let summary = Paragraph::new(summary_text)
+            .style(Style::default().fg(Color::White))
+            .block(Block::default().borders(Borders::ALL).title("完成"))
+            .wrap(Wrap { trim: true });
+        f.render_widget(summary, chunks[1]);
+
+        // Instructions
+        let instructions = Paragraph::new("按 Enter 退出")
+            .style(Style::default().fg(Color::Gray))
+            .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(instructions, chunks[2]);
+    }
+
+    pub fn show_confirmation(&mut self, message: &str) -> Result<bool> {
+        let popup_area = centered_rect(60, 20, self.terminal.size()?);
+
+        loop {
+            self.terminal.draw(|f| {
+                f.render_widget(Clear, f.size());
+
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Min(3),
+                        Constraint::Length(3),
+                    ])
+                    .split(popup_area);
+
+                let title = Paragraph::new("确认")
+                    .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                    .block(Block::default().borders(Borders::ALL))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(title, chunks[0]);
+
+                let msg = Paragraph::new(message)
+                    .style(Style::default().fg(Color::White))
+                    .block(Block::default().borders(Borders::ALL))
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .wrap(Wrap { trim: true });
+                f.render_widget(msg, chunks[1]);
+
+                let instructions = Paragraph::new("Y: 是 | N: 否 | ESC: 取消")
+                    .style(Style::default().fg(Color::Gray))
+                    .block(Block::default().borders(Borders::ALL))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(instructions, chunks[2]);
+            })?;
+
+            if event::poll(Duration::from_millis(100))? {
+                if let Event::Key(KeyEvent { code, .. }) = event::read()? {
+                    match code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(true),
+                        KeyCode::Char('n') | KeyCode::Char('N') => return Ok(false),
+                        KeyCode::Esc => return Ok(false),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn handle_events(&self) -> Result<KeyCode> {
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(KeyEvent { code, .. }) = event::read()? {
+                return Ok(code);
+            }
+        }
+        Ok(KeyCode::Null)
+    }
+}
+
+impl Drop for TuiManager {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
+        let _ = self.terminal.show_cursor();
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
