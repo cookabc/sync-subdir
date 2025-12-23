@@ -130,25 +130,25 @@ async fn run_application(
             AppState::FileSelection => {
                 // Load file changes on first entry
                 if !app.loaded_changes {
-                    info!("Loading file changes...");
-                    app.status_message = "正在加载文件变更...".to_string();
+                    info!("Loading commits...");
+                    app.status_message = "正在加载提交历史...".to_string();
                     tui_manager.draw(app)?;
                     
-                    match load_file_changes(&app.config, git_manager) {
-                        Ok(changes) => {
-                            info!("Successfully loaded {} changes", changes.len());
-                            app.set_file_changes(changes);
+                    match load_commits(&app.config, git_manager) {
+                        Ok(commits) => {
+                            info!("Successfully loaded {} commits", commits.len());
+                            app.set_commits(commits);
                             app.loaded_changes = true;
-                            if !app.file_changes.is_empty() {
+                            if !app.commits.is_empty() {
                                 app.list_state.select(Some(0));
                             } else {
-                                app.status_message = "未发现任何变更".to_string();
+                                app.status_message = "未发现任何相关提交".to_string();
                                 app.state = AppState::Completed;
                             }
                         }
                         Err(e) => {
-                            error!("Failed to load changes: {}", e);
-                            app.status_message = format!("加载变更失败: {}", e);
+                            error!("Failed to load commits: {}", e);
+                            app.status_message = format!("加载提交失败: {}", e);
                             app.state = AppState::Completed;
                         }
                     }
@@ -162,16 +162,16 @@ async fn run_application(
                 match key {
                     KeyCode::Up => app.previous(),
                     KeyCode::Down => app.next(),
-                    KeyCode::Char(' ') => app.toggle_file_selection(),
+                    KeyCode::Char(' ') => app.toggle_commit_selection(),
                     KeyCode::Char('a') => app.select_all(),
                     KeyCode::Char('A') => app.deselect_all(),
                     KeyCode::Enter => {
                         if app.get_selected_count() > 0 {
-                            info!("Transitioning to Confirmation state with {} files", app.get_selected_count());
+                            info!("Transitioning to Confirmation state with {} commits", app.get_selected_count());
                             app.state = AppState::Confirmation;
                             app.current_confirmation = Some(ConfirmationAction::ExecuteSync);
                         } else {
-                            warn!("Enter pressed but no files selected");
+                            warn!("Enter pressed but no commits selected");
                         }
                     }
                     KeyCode::Char('q') | KeyCode::Esc => {
@@ -235,14 +235,12 @@ async fn run_application(
 async fn perform_sync(
     app: &mut App,
     tui_manager: &mut TuiManager,
-    _git_manager: &mut GitManager,
+    git_manager: &mut GitManager,
 ) -> Result<()> {
     let sync_config = SyncConfig {
         source_repo: app.config.source_repo.clone(),
         target_repo: app.config.target_repo.clone(),
         subdir: app.config.subdir.clone(),
-        sync_delete: app.config.sync_delete.unwrap_or(true),
-        verbose: app.config.verbose,
     };
 
     let mut sync_engine = SyncEngine::new(sync_config, app.config.dry_run);
@@ -250,22 +248,20 @@ async fn perform_sync(
     // Validate paths
     sync_engine.validate_paths()?;
 
-    // Filter selected changes
-    let selected_changes: Vec<_> = app.file_changes
+    // Filter selected commits
+    let selected_commits: Vec<_> = app.commits
         .iter()
-        .zip(app.selected_files.iter())
-        .filter_map(|(change, &selected)| if selected { Some(change.clone()) } else { None })
+        .zip(app.selected_commits.iter())
+        .filter_map(|(commit, &selected)| if selected { Some(commit.clone()) } else { None })
         .collect();
 
-    let selected_files: Vec<bool> = vec![true; selected_changes.len()];
-
     // Perform sync with progress callback
-    let stats = sync_engine.sync_files(
-        &selected_changes,
-        &selected_files,
-        |current, total, file_path, status| {
+    let stats = sync_engine.sync_commits(
+        git_manager,
+        &selected_commits,
+        |current, total, subject, status| {
             app.progress = current as f64 / total as f64;
-            app.status_message = format!("{} - {}", file_path, status);
+            app.status_message = format!("[{}] {}", status, subject);
             let _ = tui_manager.draw(app);
         },
     ).await?;
@@ -274,37 +270,36 @@ async fn perform_sync(
     app.progress = 1.0;
     app.end_time = Some(std::time::Instant::now());
     app.status_message = format!(
-        "同步完成: 总计 {}, 同步 {}, 删除 {}, 失败 {}, 跳过 {}",
-        stats.total_files,
-        stats.synced_files,
-        stats.deleted_files,
-        stats.failed_files,
-        stats.skipped_files
+        "同步完成: 总计 {}, 同步 {}, 失败 {}, 跳过 {}",
+        stats.total_commits,
+        stats.synced_commits,
+        stats.failed_commits,
+        stats.skipped_commits
     );
 
     Ok(())
 }
 
-fn load_file_changes(config: &Config, git_manager: &GitManager) -> Result<Vec<git::FileChange>> {
+fn load_commits(config: &Config, git_manager: &GitManager) -> Result<Vec<git::CommitInfo>> {
     let end_commit = config.end_commit.as_ref().map(|s| s.as_str()).unwrap_or("HEAD");
     let include_start = config.include_start.unwrap_or(true);
-    let exclude_merges = config.no_merge.unwrap_or(false);
+    let first_parent = config.no_merge.unwrap_or(true); // Default to true as per user request
 
-    let changes = git_manager.get_file_changes(
+    let commits = git_manager.get_commits_in_range(
         &config.subdir,
         &config.start_commit,
         end_commit,
         include_start,
-        exclude_merges,
+        first_parent,
     )?;
 
-    if changes.is_empty() {
-        warn!("No file changes found in the specified range");
+    if commits.is_empty() {
+        warn!("No relevant commits found in the specified range");
     } else {
-        info!("Found {} file changes to sync", changes.len());
+        info!("Found {} commits to sync", commits.len());
     }
 
-    Ok(changes)
+    Ok(commits)
 }
 
 fn validate_config(config: &Config) -> Result<()> {

@@ -18,7 +18,7 @@ use std::io::stdout;
 use std::time::{Duration, Instant};
 
 use crate::cli::Config;
-use crate::git::{FileChange, FileStatus};
+use crate::git::CommitInfo;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppState {
@@ -45,8 +45,8 @@ pub enum ConfirmationAction {
 pub struct App {
     pub state: AppState,
     pub config: Config,
-    pub file_changes: Vec<FileChange>,
-    pub selected_files: Vec<bool>,
+    pub commits: Vec<CommitInfo>,
+    pub selected_commits: Vec<bool>,
     pub current_confirmation: Option<ConfirmationAction>,
     pub progress: f64,
     pub status_message: String,
@@ -64,8 +64,8 @@ impl App {
         Self {
             state: AppState::ConfigReview,
             config,
-            file_changes: Vec::new(),
-            selected_files: Vec::new(),
+            commits: Vec::new(),
+            selected_commits: Vec::new(),
             current_confirmation: None,
             progress: 0.0,
             status_message: String::new(),
@@ -79,16 +79,16 @@ impl App {
         }
     }
 
-    pub fn set_file_changes(&mut self, changes: Vec<FileChange>) {
-        let count = changes.len();
-        self.file_changes = changes;
-        self.selected_files = vec![true; count];
+    pub fn set_commits(&mut self, commits: Vec<CommitInfo>) {
+        let count = commits.len();
+        self.commits = commits;
+        self.selected_commits = vec![true; count];
     }
 
     pub fn next(&mut self) {
         let i = match self.list_state.selected() {
             Some(i) => {
-                if i >= self.file_changes.len() - 1 {
+                if i >= self.commits.len() - 1 {
                     0
                 } else {
                     i + 1
@@ -103,7 +103,7 @@ impl App {
         let i = match self.list_state.selected() {
             Some(i) => {
                 if i == 0 {
-                    self.file_changes.len() - 1
+                    self.commits.len() - 1
                 } else {
                     i - 1
                 }
@@ -113,24 +113,24 @@ impl App {
         self.list_state.select(Some(i));
     }
 
-    pub fn toggle_file_selection(&mut self) {
+    pub fn toggle_commit_selection(&mut self) {
         if let Some(i) = self.list_state.selected() {
-            if i < self.selected_files.len() {
-                self.selected_files[i] = !self.selected_files[i];
+            if i < self.selected_commits.len() {
+                self.selected_commits[i] = !self.selected_commits[i];
             }
         }
     }
 
     pub fn select_all(&mut self) {
-        self.selected_files.fill(true);
+        self.selected_commits.fill(true);
     }
 
     pub fn deselect_all(&mut self) {
-        self.selected_files.fill(false);
+        self.selected_commits.fill(false);
     }
 
     pub fn get_selected_count(&self) -> usize {
-        self.selected_files.iter().filter(|&&selected| selected).count()
+        self.selected_commits.iter().filter(|&&selected| selected).count()
     }
 }
 
@@ -220,15 +220,15 @@ impl TuiManager {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
-                Constraint::Min(10),  // Reduced minimum height to give more space to content
+                Constraint::Min(10),
                 Constraint::Length(3),
             ])
             .split(f.size());
 
-        // Header with stats
+        // Header
         let header_text = format!(
-            "文件列表 (总计: {}, 已选择: {})",
-            app.file_changes.len(),
+            "待同步提交列表 (总计: {}, 已选择: {})",
+            app.commits.len(),
             app.get_selected_count()
         );
         let header = Paragraph::new(header_text)
@@ -236,60 +236,46 @@ impl TuiManager {
             .block(Block::default().borders(Borders::ALL));
         f.render_widget(header, chunks[0]);
 
-        // File list - Render with unlimited width to show full paths
-        for (i, change) in app.file_changes.iter().enumerate() {
-            let status_symbol = match change.status {
-                FileStatus::Added => "[+]",
-                FileStatus::Modified => "[~]",
-                FileStatus::Deleted => "[-]",
-                FileStatus::Renamed => "[→]",
-                FileStatus::TypeChanged => "[T]",
+        // Commit Table
+        let rows: Vec<Row> = app.commits.iter().enumerate().map(|(i, commit)| {
+            let selected_symbol = if app.selected_commits[i] { "✓" } else { " " };
+            let style = if Some(i) == app.list_state.selected() {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else if commit.is_merge {
+                Style::default().fg(Color::Blue)
+            } else {
+                Style::default().fg(Color::White)
             };
 
-            let selected_symbol = if app.selected_files[i] { "✓" } else { " " };
+            Row::new(vec![
+                Cell::from(selected_symbol),
+                Cell::from(commit.id[..7].to_string()),
+                Cell::from(commit.subject.clone()),
+                Cell::from(commit.author.clone()),
+                Cell::from(commit.date.clone()),
+            ]).style(style)
+        }).collect();
 
-            let color = match change.status {
-                FileStatus::Added => Color::Green,
-                FileStatus::Modified => Color::Yellow,
-                FileStatus::Deleted => Color::Red,
-                FileStatus::Renamed => Color::Blue,
-                FileStatus::TypeChanged => Color::Magenta,
-            };
-
-            let content = format!("{} {} {}", selected_symbol, status_symbol, change.path);
-
-            // Create a paragraph for each line with unlimited width
-            let y_pos = chunks[1].y + 1 + i as u16;
-            if y_pos < chunks[1].y + chunks[1].height - 1 {
-                // Create an area that extends beyond the visible bounds
-                let line_area = Rect {
-                    x: chunks[1].x + 1,
-                    y: y_pos,
-                    width: chunks[1].width.saturating_sub(2),  // Use available width minus borders
-                    height: 1,
-                };
-
-                let style = if Some(i) == app.list_state.selected() {
-                    Style::default().bg(Color::DarkGray).fg(color)
-                } else {
-                    Style::default().fg(color)
-                };
-
-                let line_paragraph = Paragraph::new(content)
-                    .style(style)
-                    .wrap(Wrap { trim: false });  // Don't trim, let it extend
-
-                f.render_widget(line_paragraph, line_area);
-            }
-        }
-
-        // Draw border around the file list area
-        let border = Block::default().borders(Borders::ALL);
-        f.render_widget(border, chunks[1]);
+        let table = Table::new(rows)
+            .header(
+                Row::new(vec![" ", "Hash", "Subject", "Author", "Date"])
+                    .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            )
+            .widths(&[
+                Constraint::Length(2),
+                Constraint::Length(8),
+                Constraint::Percentage(50),
+                Constraint::Percentage(15),
+                Constraint::Percentage(25),
+            ])
+            .block(Block::default().borders(Borders::ALL).title("提交详情"))
+            .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+        
+        f.render_widget(table, chunks[1]);
 
         // Instructions
         let instructions = Paragraph::new(
-            "↑/↓: 导航 | Space: 选择/取消 | a: 全选 | A: 取消全选 | Enter: 继续 | q: 退出"
+            "↑/↓: 导航 | Space: 选择/取消 | a: 全选 | A: 取消全选 | Enter: 开始同步 | q: 退出"
         )
         .style(Style::default().fg(Color::Gray))
         .wrap(Wrap { trim: true });
