@@ -1,476 +1,286 @@
 #!/bin/bash
 #
-# sync-subdir-changes.sh - 子目录变更同步工具
-# 将源仓库中某个子目录的变更同步到独立的目标仓库
+# sync-subdir.sh - 子目录变更同步工具 (高性能 Git Patch 版)
+#
+# 将源仓库中某个目录或文件的变更，逐个 Commit 同步到目标仓库。
+# 原理: 使用 git format-patch + git am 构建高效、非侵入式的同步管道。
 #
 
-set -e
-
-################################################################################
-# 常量和颜色定义
-################################################################################
-
-readonly RED='\033[0;31m'
+# 颜色定义
+readonly BLUE='\033[0;34m'
 readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
+readonly RED='\033[0;31m'
 readonly NC='\033[0m'
 
-################################################################################
-# 工具函数
-################################################################################
-
-show_help() {
-    cat << 'EOF'
-用法: sync-subdir [选项] <源仓库> <子目录> <目标仓库> <起始commit>
-
-将源仓库中某个子目录自指定 commit 以来的变更同步到独立的目标仓库。
-
-参数:
-    源仓库        源 Git 仓库路径
-    子目录        源仓库中要同步的子目录名称
-    目标仓库      目标 Git 仓库路径
-    起始commit    起始 commit hash
-
-选项:
-    -b, --branch <分支>       源仓库分支 (默认: 当前分支)
-    -t, --target-branch <分支> 目标仓库分支 (默认: 与源分支同名)
-    -e, --end <commit>        结束 commit (默认: HEAD)
-
-    -c, --create-branch       自动创建目标分支 (默认)
-    --no-create-branch        禁止自动创建目标分支
-
-    -i, --include-start       包含起始 commit 的变更 (默认)
-    --no-include-start        不包含起始 commit 的变更
-
-    -n, --no-merge            排除 merge 引入的变更
-    --delete                  同步删除操作 (默认)
-    --no-delete               不同步删除操作
-    --stash                   自动 stash 目标仓库未提交变更
-
-    -d, --dry-run             预览模式，不实际执行
-    -v, --verbose             详细输出
-    -y, --yes                 跳过确认，使用默认值
-    -h, --help                显示帮助
-
-交互模式:
-    未通过参数指定时，脚本会询问:
-    - 是否创建新分支、是否 stash、是否包含起始 commit
-    - 是否排除 merge 变更、是否同步删除
-    使用 -y 或 -d 跳过询问
-
-示例:
-    sync-subdir /repo/main submodule /repo/sub abc123
-    sync-subdir -b feature/x -n /repo/main submodule /repo/sub abc123
-EOF
-}
-
+# 日志函数
 log_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
 log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 
-# 交互式询问 (返回: 0=yes, 1=no)
-ask_user() {
-    local question="$1" default="$2"
+show_help() {
+    cat << EOF
+${BLUE}Sync Subdir${NC} - 子目录高效同步工具
 
-    # -y 或 dry-run 模式使用默认值
-    if $YES || $DRY_RUN; then
-        [[ "$default" == "y" ]] && return 0 || return 1
-    fi
+用法: $(basename "$0") [选项] <源路径> <目标仓库> <commit范围>
 
-    local prompt="$question "
-    [[ "$default" == "y" ]] && prompt+="[Y/n] " || prompt+="[y/N] "
+参数:
+    源路径          源仓库中的目录或文件路径 (支持自动探测仓库根目录)
+    目标仓库        目标 Git 仓库路径
+    commit范围      Git Revision Range (例如: main, HEAD~5..HEAD, v1.0..v2.0)
+                    注意: 单个 commit hash 等同于 "hash..当前分支"
 
-    read -p "$prompt" -n 1 -r
-    echo ""
+选项:
+    -t, --target-dir <dir>   同步到目标仓库的指定子目录 (默认: 根目录)
+    -b, --branch <branch>    切换目标仓库到指定分支 (不存在则自动创建)
+    -s, --source-branch <br> 显式指定源仓库分支 (默认: 自动探测当前分支)
+    --no-first-parent        包含合并进来的所有提交 (默认: 仅跟随第一亲本)
+    --stash                  同步前自动 stash 目标仓库未提交的变更
+    --continue               解决冲突后，继续未完成的同步
+    --abort                  终止当前的同步并回滚
+    --dry-run                预览模式，仅列出待同步提交
+    -h, --help               显示帮助信息
 
-    if [[ -z "$REPLY" ]]; then
-        [[ "$default" == "y" ]] && return 0 || return 1
-    fi
-    [[ $REPLY =~ ^[Yy]$ ]] && return 0 || return 1
+示例:
+    # 同步某个子目录的最近 10 个 commit
+    $(basename "$0") ./source-repo/packages/utils ./target-repo HEAD~10
+
+    # 同步单个文件到目标仓库
+    $(basename "$0") ./source-repo/src/Main.java ./target-repo main
+EOF
 }
 
-################################################################################
-# 清理函数
-################################################################################
+# ------------------------------------------------------------------------------
+# 选项解析
+# ------------------------------------------------------------------------------
 
-RESTORE_TARGET_BRANCH=false
-STASHED=false
-
-cleanup() {
-    local exit_code=$?
-
-    # 恢复源仓库分支
-    if [[ -n "$SOURCE_REPO" && -d "$SOURCE_REPO/.git" ]]; then
-        cd "$SOURCE_REPO" 2>/dev/null || true
-        if [[ -n "$SOURCE_ORIGINAL_BRANCH" && "$SOURCE_BRANCH" != "$SOURCE_ORIGINAL_BRANCH" ]]; then
-            git checkout "$SOURCE_ORIGINAL_BRANCH" --quiet 2>/dev/null || true
-        fi
-    fi
-
-    # 恢复目标仓库
-    if $RESTORE_TARGET_BRANCH && [[ -n "$TARGET_REPO" && -d "$TARGET_REPO/.git" ]]; then
-        cd "$TARGET_REPO" 2>/dev/null || true
-        $STASHED && git stash pop --quiet 2>/dev/null || true
-        if [[ -n "$TARGET_ORIGINAL_BRANCH" && "$TARGET_BRANCH" != "$TARGET_ORIGINAL_BRANCH" ]]; then
-            git checkout "$TARGET_ORIGINAL_BRANCH" --quiet 2>/dev/null || true
-        fi
-    fi
-
-    exit $exit_code
-}
-
-trap cleanup EXIT
-
-################################################################################
-# 默认值和选项解析
-################################################################################
-
-# 选项默认值
-NO_MERGE=false
-DRY_RUN=false
-VERBOSE=false
-YES=false
-AUTO_STASH=false
-CREATE_BRANCH=true
-INCLUDE_START=true
-SYNC_DELETE=true
-SOURCE_BRANCH=""
+TARGET_SUBDIR=""
 TARGET_BRANCH=""
-END_COMMIT=""
-
-# 跟踪用户是否明确指定了选项
-STASH_SPECIFIED=false
-CREATE_BRANCH_SPECIFIED=false
-INCLUDE_START_SPECIFIED=false
-SYNC_DELETE_SPECIFIED=false
-NO_MERGE_SPECIFIED=false
+SOURCE_BRANCH=""
+FIRST_PARENT=true
+DRY_RUN=false
+AUTO_STASH=false
+MODE="sync" # sync, continue, abort
+POSITIONAL_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        -b|--branch)         SOURCE_BRANCH="$2"; shift 2 ;;
-        -t|--target-branch)  TARGET_BRANCH="$2"; shift 2 ;;
-        -e|--end)            END_COMMIT="$2"; shift 2 ;;
-        -c|--create-branch)  CREATE_BRANCH=true;  CREATE_BRANCH_SPECIFIED=true; shift ;;
-        --no-create-branch)  CREATE_BRANCH=false; CREATE_BRANCH_SPECIFIED=true; shift ;;
-        -i|--include-start)  INCLUDE_START=true;  INCLUDE_START_SPECIFIED=true; shift ;;
-        --no-include-start)  INCLUDE_START=false; INCLUDE_START_SPECIFIED=true; shift ;;
-        -n|--no-merge)       NO_MERGE=true; NO_MERGE_SPECIFIED=true; shift ;;
-        --delete)            SYNC_DELETE=true;  SYNC_DELETE_SPECIFIED=true; shift ;;
-        --no-delete)         SYNC_DELETE=false; SYNC_DELETE_SPECIFIED=true; shift ;;
-        --stash)             AUTO_STASH=true; STASH_SPECIFIED=true; shift ;;
-        -d|--dry-run)        DRY_RUN=true; shift ;;
-        -v|--verbose)        VERBOSE=true; shift ;;
-        -y|--yes)            YES=true; shift ;;
-        -h|--help)           show_help; exit 0 ;;
-        -*)                  log_error "未知选项: $1"; show_help; exit 1 ;;
-        *)                   break ;;
+        -t|--target-dir)    TARGET_SUBDIR="$2"; shift 2 ;;
+        -b|--branch)        TARGET_BRANCH="$2"; shift 2 ;;
+        -s|--source-branch) SOURCE_BRANCH="$2"; shift 2 ;;
+        --first-parent)     FIRST_PARENT=true; shift ;;
+        --no-first-parent)  FIRST_PARENT=false; shift ;;
+        --stash)            AUTO_STASH=true; shift ;;
+        --continue)         MODE="continue"; shift ;;
+        --abort)            MODE="abort"; shift ;;
+        --dry-run)          DRY_RUN=true; shift ;;
+        -y|--yes)           shift ;; # 兼容旧接口
+        -h|--help)          show_help; exit 0 ;;
+        -*)                 log_error "未知选项: $1"; show_help; exit 1 ;;
+        *)                  POSITIONAL_ARGS+=("$1"); shift ;;
     esac
 done
 
-# 检查必需参数
-if [[ $# -lt 4 ]]; then
-    log_error "参数不足"
-    show_help
-    exit 1
-fi
+set -- "${POSITIONAL_ARGS[@]}"
 
-SOURCE_REPO="$1"
-SUBDIR="$2"
-TARGET_REPO="$3"
-START_COMMIT="$4"
+# ------------------------------------------------------------------------------
+# 工具函数
+# ------------------------------------------------------------------------------
 
-################################################################################
-# 验证和初始化
-################################################################################
-
-# 验证仓库路径
-[[ ! -d "$SOURCE_REPO/.git" ]] && { log_error "无效的源仓库: $SOURCE_REPO"; exit 1; }
-[[ ! -d "$TARGET_REPO/.git" ]] && { log_error "无效的目标仓库: $TARGET_REPO"; exit 1; }
-[[ ! -d "$SOURCE_REPO/$SUBDIR" ]] && { log_error "子目录不存在: $SUBDIR"; exit 1; }
-
-# 切换到源仓库
-cd "$SOURCE_REPO"
-SOURCE_ORIGINAL_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-
-# 切换源分支
-if [[ -n "$SOURCE_BRANCH" ]]; then
-    git rev-parse --verify "$SOURCE_BRANCH" > /dev/null 2>&1 || { log_error "源分支不存在: $SOURCE_BRANCH"; exit 1; }
-    log_info "切换源仓库到分支: $SOURCE_BRANCH"
-    git checkout "$SOURCE_BRANCH" --quiet
-else
-    SOURCE_BRANCH="$SOURCE_ORIGINAL_BRANCH"
-fi
-
-# 验证 commit
-git rev-parse --verify "$START_COMMIT" > /dev/null 2>&1 || { log_error "无效的 commit: $START_COMMIT"; exit 1; }
-
-# 切换到目标仓库
-cd "$TARGET_REPO"
-TARGET_ORIGINAL_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-[[ -z "$TARGET_BRANCH" ]] && TARGET_BRANCH="$SOURCE_BRANCH"
-
-# 处理目标分支
-if ! git rev-parse --verify "$TARGET_BRANCH" > /dev/null 2>&1; then
-    if $CREATE_BRANCH_SPECIFIED; then
-        if $CREATE_BRANCH; then
-            log_info "创建目标分支: $TARGET_BRANCH"
-            git checkout -b "$TARGET_BRANCH" --quiet
-        else
-            log_error "目标分支不存在: $TARGET_BRANCH"
-            exit 1
-        fi
+# 获取绝对路径
+get_abs_path() {
+    local path="$1"
+    if [[ -d "$path" ]]; then
+        (cd "$path" && pwd)
+    elif [[ -f "$path" ]]; then
+        echo "$(cd "$(dirname "$path")" && pwd)/$(basename "$path")"
     else
-        log_warn "目标分支不存在: $TARGET_BRANCH"
-        if ask_user "是否创建新分支?" "y"; then
-            git checkout -b "$TARGET_BRANCH" --quiet
-        else
-            exit 1
-        fi
+        realpath "$path" 2>/dev/null || echo "$path"
     fi
-elif [[ "$TARGET_BRANCH" != "$TARGET_ORIGINAL_BRANCH" ]]; then
-    log_info "切换目标仓库到分支: $TARGET_BRANCH"
-    git checkout "$TARGET_BRANCH" --quiet
-fi
+}
 
-# 检查未提交变更
-if ! git diff --quiet || ! git diff --cached --quiet; then
-    if $STASH_SPECIFIED && $AUTO_STASH; then
-        log_info "Stash 目标仓库变更..."
-        git stash push -m "sync-subdir auto stash $(date +%Y%m%d-%H%M%S)" --quiet
-        STASHED=true
-    elif ! $STASH_SPECIFIED; then
-        log_warn "目标仓库有未提交的变更"
-        if ask_user "是否自动 stash?" "y"; then
-            git stash push -m "sync-subdir auto stash $(date +%Y%m%d-%H%M%S)" --quiet
-            STASHED=true
+# 交互式询问
+ask_user() {
+    local question="$1" default="$2"
+    local prompt="$question "
+    [[ "$default" == "y" ]] && prompt+="[Y/n] " || prompt+="[y/N] "
+    
+    # 从 tty 读取，防止干扰管道
+    read -p "$prompt" -n 1 -r < /dev/tty
+    echo ""
+    [[ -z "$REPLY" ]] && REPLY="$default"
+    [[ $REPLY =~ ^[Yy]$ ]] && return 0 || return 1
+}
+
+# ------------------------------------------------------------------------------
+# 核心逻辑
+# ------------------------------------------------------------------------------
+
+main() {
+    # 1. 检查特殊模式 (Continue / Abort)
+    if [[ "$MODE" != "sync" ]]; then
+        local target="${1:-$(pwd)}"
+        cd "$target" 2>/dev/null || { log_error "无效的目标仓库路径: $target"; exit 1; }
+        if [[ "$MODE" == "continue" ]]; then
+            log_info "正在继续之前的同步..."
+            git am --continue
         else
-            log_error "请先处理未提交的变更"
-            exit 1
+            log_warn "正在终止同步并回滚..."
+            git am --abort
         fi
-    else
-        log_error "目标仓库有未提交的变更"
+        exit $?
+    fi
+
+    # 2. 验证参数
+    if [[ $# -lt 3 ]]; then
+        log_error "参数不足"
+        show_help
         exit 1
     fi
-fi
 
-# 切回源仓库
-cd "$SOURCE_REPO"
+    log_info "正在初始化同步任务..."
 
-# 设置结束 commit
-if [[ -z "$END_COMMIT" ]]; then
-    END_COMMIT="HEAD"
-else
-    git rev-parse --verify "$END_COMMIT" > /dev/null 2>&1 || { log_error "无效的结束 commit: $END_COMMIT"; exit 1; }
-fi
+    local raw_src="$1"
+    local raw_dest="$2"
+    local rev_range="$3"
 
-################################################################################
-# 显示配置信息
-################################################################################
+    # 解析路径
+    local source_path=$(get_abs_path "$raw_src")
+    local target_repo=$(get_abs_path "$raw_dest")
+    
+    [[ ! -d "$target_repo/.git" ]] && { log_error "目标仓库无效: $target_repo"; exit 1; }
 
-log_info "源仓库: $SOURCE_REPO ($SOURCE_BRANCH)"
-log_info "目标仓库: $TARGET_REPO ($TARGET_BRANCH)"
-log_info "子目录: $SUBDIR"
-log_info "Commit 范围: $START_COMMIT...$END_COMMIT"
-echo ""
-
-# 询问是否包含起始 commit
-if ! $INCLUDE_START_SPECIFIED && ! $YES && ! $DRY_RUN; then
-    if ! ask_user "是否包含起始 commit 的变更?" "y"; then
-        INCLUDE_START=false
+    # 探测源仓库和子目录
+    local source_dir_to_check="$source_path"
+    [[ ! -d "$source_path" ]] && source_dir_to_check=$(dirname "$source_path")
+    
+    cd "$source_dir_to_check" 2>/dev/null || { log_error "无法访问源路径: $source_path"; exit 1; }
+    local source_repo=$(git rev-parse --show-toplevel 2>/dev/null)
+    local source_subdir=$(git rev-parse --show-prefix)
+    
+    # 处理单文件情况
+    if [[ -f "$source_path" ]]; then
+        source_subdir="${source_subdir}$(basename "$source_path")"
     fi
-fi
+    source_subdir="${source_subdir%/}"
 
-################################################################################
-# 分析变更
-################################################################################
+    [[ -z "$source_repo" ]] && { log_error "源路径不在 Git 仓库中: $source_path"; exit 1; }
 
-# 设置 commit 范围
-INCLUDE_ROOT_COMMIT=false
-if $INCLUDE_START; then
-    if git rev-parse --verify "${START_COMMIT}^" > /dev/null 2>&1; then
-        COMMIT_RANGE="${START_COMMIT}^..${END_COMMIT}"
-    else
-        log_info "起始 commit 是首个 commit"
-        COMMIT_RANGE="${START_COMMIT}..${END_COMMIT}"
-        INCLUDE_ROOT_COMMIT=true
+    log_info "源仓库: $source_repo"
+    log_info "同步内容: ${source_subdir:-. (根目录)}"
+    log_info "目标仓库: $target_repo"
+
+    # 3. 准备目标仓库
+    cd "$target_repo" || exit 1
+    
+    # 状态检查
+    if [[ -d .git/rebase-apply ]]; then
+        log_error "目标仓库处于同步中断状态。请先解决冲突或使用 --abort"
+        exit 1
     fi
-else
-    COMMIT_RANGE="${START_COMMIT}..${END_COMMIT}"
-fi
 
-log_info "正在分析变更..."
-
-# 获取变更文件列表
-declare -a ALL_FILES FILES_TO_SYNC FILES_TO_RESTORE
-
-while IFS= read -r file; do
-    [[ -n "$file" ]] && ALL_FILES+=("$file")
-done < <(git diff --name-only "$COMMIT_RANGE" -- "$SUBDIR/")
-
-if $INCLUDE_ROOT_COMMIT; then
-    while IFS= read -r file; do
-        [[ -n "$file" ]] && ALL_FILES+=("$file")
-    done < <(git diff-tree --no-commit-id --name-only -r "$START_COMMIT" -- "$SUBDIR/" 2>/dev/null || true)
-    readarray -t ALL_FILES < <(printf '%s\n' "${ALL_FILES[@]}" | sort -u)
-fi
-
-if [[ ${#ALL_FILES[@]} -eq 0 ]]; then
-    log_warn "没有发现任何变更"
-    exit 0
-fi
-
-# 统计提交
-TOTAL_COMMITS=$(git log --oneline "$COMMIT_RANGE" -- "$SUBDIR/" | wc -l | tr -d ' ')
-MERGE_COMMITS=$(git log --oneline --merges "$COMMIT_RANGE" -- "$SUBDIR/" | wc -l | tr -d ' ')
-
-log_info "提交数: $TOTAL_COMMITS (直接: $((TOTAL_COMMITS - MERGE_COMMITS)), Merge: $MERGE_COMMITS)"
-
-# 询问是否排除 merge
-if [[ $MERGE_COMMITS -gt 0 ]] && ! $NO_MERGE_SPECIFIED; then
-    log_warn "检测到 $MERGE_COMMITS 个 merge 提交"
-    if ask_user "是否排除 merge 引入的变更?" "y"; then
-        NO_MERGE=true
-    fi
-fi
-
-# 处理 merge 排除
-DIRECT_FILES=""
-if $NO_MERGE && [[ $MERGE_COMMITS -gt 0 ]]; then
-    log_info "排除 merge 引入的变更"
-    DIRECT_FILES=$(git log --name-only --no-merges --first-parent --format="" "$COMMIT_RANGE" -- "$SUBDIR/" | sort -u | grep -v '^$')
-
-    has_excluded=false
-    for file in "${ALL_FILES[@]}"; do
-        if ! echo "$DIRECT_FILES" | grep -qx "$file"; then
-            $has_excluded || { log_warn "以下文件将被排除:"; has_excluded=true; }
-            echo "  - $file"
-        fi
-    done
-    $has_excluded && echo ""
-fi
-
-# 分类文件
-for file in "${ALL_FILES[@]}"; do
-    if $NO_MERGE && [[ $MERGE_COMMITS -gt 0 ]]; then
-        if echo "$DIRECT_FILES" | grep -qx "$file"; then
-            FILES_TO_SYNC+=("$file")
+    if [[ -n $(git status --porcelain) ]]; then
+        if $AUTO_STASH; then
+            log_info "正在自动 Stash 目标仓库变更..."
+            git stash push -m "sync-subdir auto stash" --quiet
         else
-            FILES_TO_RESTORE+=("$file")
+            log_error "目标仓库有未提交变更。建议先清理或使用 --stash"
+            exit 1
         fi
-    else
-        FILES_TO_SYNC+=("$file")
     fi
-done
 
-################################################################################
-# 显示文件列表
-################################################################################
-
-log_info "将同步 ${#FILES_TO_SYNC[@]} 个文件:"
-
-for file in "${FILES_TO_SYNC[@]}"; do
-    if $VERBOSE; then
-        STATUS=$(git diff --name-status "$COMMIT_RANGE" -- "$file" 2>/dev/null | cut -f1)
-        case $STATUS in
-            A) echo -e "  ${GREEN}[+]${NC} $file" ;;
-            M) echo -e "  ${YELLOW}[~]${NC} $file" ;;
-            D) echo -e "  ${RED}[-]${NC} $file" ;;
-            *) echo "  $file" ;;
-        esac
-    else
-        echo "  - $file"
+    # 分支处理
+    if [[ -n "$TARGET_BRANCH" ]]; then
+        if git rev-parse --verify "$TARGET_BRANCH" >/dev/null 2>&1; then
+            git checkout "$TARGET_BRANCH" --quiet
+        else
+            log_info "在目标仓库创建新分支: $TARGET_BRANCH"
+            git checkout -b "$TARGET_BRANCH" --quiet
+        fi
     fi
-done
-echo ""
 
-# Dry-run 模式退出
-if $DRY_RUN; then
-    log_warn "Dry-run 模式，不执行实际操作"
-    RESTORE_TARGET_BRANCH=true
-    exit 0
-fi
+    # 4. 分析与生成补丁
+    local patch_dir=$(mktemp -d "/tmp/sync-subdir-patches-XXXXXX")
+    trap "rm -rf $patch_dir" EXIT
 
-################################################################################
-# 执行同步
-################################################################################
-
-# 检测删除文件
-DELETED_COUNT=0
-for file in "${FILES_TO_SYNC[@]}"; do
-    if [[ ! -f "$SOURCE_REPO/$file" && -f "$TARGET_REPO/${file#$SUBDIR/}" ]]; then
-        ((DELETED_COUNT++))
+    # 分支解析逻辑
+    cd "$source_repo" || exit 1
+    local current_src_br=$(git rev-parse --abbrev-ref HEAD)
+    local effective_src_br="${SOURCE_BRANCH:-$current_src_br}"
+    
+    # 如果范围包含 HEAD，替换为明确的分支名以确保稳定性
+    if [[ "$rev_range" == *"HEAD"* ]]; then
+        log_info "锁定源分支: $effective_src_br (解析自 HEAD)"
+        rev_range="${rev_range/HEAD/$effective_src_br}"
+    elif [[ "$rev_range" != *".."* ]]; then
+        # 默认从该点到分支 HEAD
+        rev_range="${rev_range}..${effective_src_br}"
     fi
-done
 
-if [[ $DELETED_COUNT -gt 0 ]] && ! $SYNC_DELETE_SPECIFIED; then
-    log_warn "检测到 $DELETED_COUNT 个文件已删除"
-    if ! ask_user "是否同步删除?" "y"; then
-        SYNC_DELETE=false
-    fi
-fi
+    log_info "正在分析变更逻辑 ($rev_range)..."
+    [[ "$FIRST_PARENT" == "true" ]] && log_info "配置: 仅跟随第一亲本 (First Parent)"
+    
+    # 生成 Patch 列表
+    (
+        local fp_args=("-o" "$patch_dir" "--binary" "--full-index" "--relative=$source_subdir")
+        [[ "$FIRST_PARENT" == "true" ]] && fp_args+=("--first-parent")
+        
+        git format-patch "${fp_args[@]}" "$rev_range" -- "$source_subdir" > /dev/null
+    )
 
-# 最终确认
-if ! $YES; then
-    if ! ask_user "是否执行同步?" "n"; then
-        log_warn "操作已取消"
-        RESTORE_TARGET_BRANCH=true
+    local patches=($(ls "$patch_dir"/*.patch 2>/dev/null | sort))
+    if [[ ${#patches[@]} -eq 0 ]]; then
+        log_warn "未检测到针对指定内容的任何变更。"
         exit 0
     fi
-fi
 
-log_info "正在同步..."
+    log_info "共发现 ${#patches[@]} 个待同步 Commit。"
 
-SYNCED=0 DELETED=0 FAILED=0
-TOTAL=${#FILES_TO_SYNC[@]} CURRENT=0
-
-for file in "${FILES_TO_SYNC[@]}"; do
-    ((CURRENT++))
-    RELATIVE="${file#$SUBDIR/}"
-    DEST="$TARGET_REPO/$RELATIVE"
-
-    $VERBOSE && printf "\r[%d/%d] %s...                    \r" "$CURRENT" "$TOTAL" "${RELATIVE:0:40}"
-
-    # 处理删除
-    if [[ ! -f "$SOURCE_REPO/$file" ]]; then
-        if [[ -f "$DEST" ]] && $SYNC_DELETE; then
-            rm "$DEST" && ((DELETED++)) || ((FAILED++))
-        fi
-        continue
+    # 预览模式
+    if $DRY_RUN; then
+        echo -e "\n--- 待同步列表 ---"
+        for p in "${patches[@]}"; do 
+            grep "^Subject: " "$p" | head -1 | sed 's/Subject: \[PATCH.*\] //g'
+        done
+        log_success "\n预览完成，未执行实际变更。"
+        exit 0
     fi
 
-    # 创建目录并复制
-    mkdir -p "$(dirname "$DEST")"
-    cp "$SOURCE_REPO/$file" "$DEST" && ((SYNCED++)) || ((FAILED++))
-done
-$VERBOSE && echo ""
+    # 5. 执行补丁应用
+    cd "$target_repo" || exit 1
+    local am_args=("--3way" "--committer-date-is-author-date")
+    [[ -n "$TARGET_SUBDIR" ]] && am_args+=("--directory=$TARGET_SUBDIR")
 
-# 恢复 merge 排除的文件
-if $NO_MERGE && [[ ${#FILES_TO_RESTORE[@]} -gt 0 ]]; then
-    log_info "恢复被排除的文件..."
-    cd "$TARGET_REPO"
-    for file in "${FILES_TO_RESTORE[@]}"; do
-        RELATIVE="${file#$SUBDIR/}"
-        git ls-files --error-unmatch "$RELATIVE" > /dev/null 2>&1 && \
-            git checkout HEAD -- "$RELATIVE" 2>/dev/null || true
+    local count=0
+    for p in "${patches[@]}"; do
+        ((count++))
+        local subj=$(grep "^Subject: " "$p" | head -1 | sed 's/Subject: \[PATCH.*\] //g')
+        printf "[%d/%d] Applying: %s... " "$count" "${#patches[@]}" "${subj:0:40}"
+        
+        if git am "${am_args[@]}" "$p" > /dev/null 2>&1; then
+            echo -e "${GREEN}完成${NC}"
+        else
+            # 处理空补丁 (该 Commit 虽然在范围内，但没改目标子目录)
+            if [[ -d .git/rebase-apply ]] && ! git status --porcelain | grep -q "^M"; then
+                echo -e "${YELLOW}空补丁${NC}"
+                if ask_user "  --> 提交无实质内容变更，是否跳过?" "y"; then
+                    git am --skip > /dev/null 2>&1
+                    continue
+                else
+                    log_error "操作已由用户中止。"
+                    exit 1
+                fi
+            else
+                # 真正的合并冲突
+                echo -e "${RED}失败${NC}"
+                log_error "遇到合并冲突！请在目标仓库手动解决后运行: $(basename "$0") --continue"
+                exit 1
+            fi
+        fi
     done
-fi
 
-################################################################################
-# 完成
-################################################################################
+    log_success "\n所有变更同步成功！"
+}
 
-echo ""
-log_success "同步完成！"
-log_info "同步: $SYNCED  删除: $DELETED  失败: $FAILED"
-
-echo ""
-log_info "目标仓库状态:"
-cd "$TARGET_REPO"
-git status --short
-
-if $STASHED; then
-    echo ""
-    log_warn "之前 stash 了变更，请手动执行 'git stash pop'"
-fi
+main "$@"
