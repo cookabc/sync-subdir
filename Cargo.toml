@@ -27,6 +27,7 @@ tokio = { version = "1.0", features = ["full"] }
 # 错误处理
 anyhow = "1.0"
 thiserror = "1.0"
+tempfile = "3.8"
 
 # 日志和进度
 tracing = "0.1"

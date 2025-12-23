@@ -1,23 +1,15 @@
-use anyhow::{Context, Result};
-use tracing::{error, debug};
-use git2::{Repository, StatusOptions, Oid, Commit, Diff, DiffDelta};
+use anyhow::{anyhow, Context, Result};
+use tracing::debug;
+use git2::{Repository, StatusOptions, Commit, DiffDelta};
 use std::path::{Path, PathBuf};
-use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
-pub enum FileStatus {
-    Added,
-    Modified,
-    Deleted,
-    Renamed,
-    TypeChanged,
-}
-
-#[derive(Debug, Clone)]
-pub struct FileChange {
-    pub path: String,
-    pub status: FileStatus,
-    pub old_path: Option<String>, // For renamed files
+pub struct CommitInfo {
+    pub id: String,
+    pub subject: String,
+    pub author: String,
+    pub date: String,
+    pub is_merge: bool,
 }
 
 #[derive(Debug)]
@@ -143,10 +135,14 @@ impl GitManager {
             .with_context(|| "Failed to create git signature")?;
 
         // Stash changes
-        repo.stash_save(&signature, message, None)
-            .with_context(|| "Failed to stash changes")?;
-
-        Ok(())
+        match repo.stash_save(&signature, message, None) {
+            Ok(_) => Ok(()),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                debug!("Nothing to stash in {} repo", if is_target { "target" } else { "source" });
+                Ok(())
+            }
+            Err(e) => Err(anyhow::Error::from(e)).context("Failed to stash changes"),
+        }
     }
 
     pub fn pop_stash(&self, is_target: bool) -> Result<()> {
@@ -163,19 +159,18 @@ impl GitManager {
         Ok(())
     }
 
-    pub fn get_file_changes(
+    pub fn get_commits_in_range(
         &self,
         subdir: &str,
         start_commit: &str,
         end_commit: &str,
         include_start: bool,
-        exclude_merges: bool,
-    ) -> Result<Vec<FileChange>> {
-        debug!("get_file_changes: subdir={}, start={}, end={}, include_start={}, exclude_merges={}", 
-               subdir, start_commit, end_commit, include_start, exclude_merges);
+        first_parent: bool,
+    ) -> Result<Vec<CommitInfo>> {
+        debug!("get_commits_in_range: subdir={}, start={}, end={}, include_start={}, first_parent={}", 
+               subdir, start_commit, end_commit, include_start, first_parent);
         let repo = self.get_repository(true)?;
 
-        // Resolve commit references (supports both OIDs and references like HEAD)
         let start_obj = repo.revparse_single(start_commit)
             .with_context(|| format!("Invalid start commit: {}", start_commit))?;
         let end_obj = repo.revparse_single(end_commit)
@@ -184,155 +179,136 @@ impl GitManager {
         let start_oid = start_obj.id();
         let end_oid = end_obj.id();
 
-        let start_commit_obj = start_obj.peel_to_commit()
-            .with_context(|| format!("Start commit not found: {}", start_commit))?;
-        debug!("Resolved start commit to: {}", start_commit_obj.id());
+        let start_commit_obj = start_obj.peel_to_commit()?;
         
-        let _end_commit_obj = end_obj.peel_to_commit()
-            .with_context(|| format!("End commit not found: {}", end_commit))?;
-        debug!("Resolved end commit to: {}", _end_commit_obj.id());
-
-        let mut changes = Vec::new();
-        let subdir_pattern = format!("{}/", subdir.trim_end_matches('/'));
-
-        // Determine the commit range
-        let (range_start, include_start_changes) = if include_start {
+        // Determine the commit range starting point
+        let range_start = if include_start {
             if let Ok(parent) = start_commit_obj.parent(0) {
-                (parent.id(), true)
+                parent.id()
             } else {
-                // Start commit is the root commit
-                (start_oid, false)
+                start_oid // Root commit
             }
         } else {
-            (start_oid, false)
+            start_oid
         };
 
-        // Get commit range
-        let mut revwalk = repo.revwalk()
-            .with_context(|| "Failed to create revwalk")?;
-        revwalk.push_range(&format!("{}..{}", range_start, end_oid))
-            .with_context(|| "Failed to set commit range")?;
-
-        // Collect commits (reverse to get chronological order)
-        let mut commits: Vec<Commit> = revwalk
-            .filter_map(|id| {
-                match id {
-                    Ok(id) => repo.find_commit(id).ok(),
-                    Err(e) => {
-                        error!("Revwalk error: {}", e);
-                        None
-                    }
-                }
-            })
-            .collect();
-        debug!("Found {} total commits in range", commits.len());
-        commits.reverse();
-        debug!("Processing commits in chronological order");
-
-        // Process each commit
-        for commit in commits {
-            // Skip merge commits if requested
-            if exclude_merges && commit.parents().len() > 1 {
-                continue;
-            }
-
-            // Get changes for this commit
-            if let Ok(parent) = commit.parent(0) {
-                let tree_a = parent.tree()?;
-                let tree_b = commit.tree()?;
-
-                let mut diff = repo.diff_tree_to_tree(Some(&tree_a), Some(&tree_b), None)?;
-                self.process_diff(&mut diff, &subdir_pattern, &mut changes)?;
-            } else if commit.parents().len() == 0 {
-                // Initial commit - compare to empty tree
-                let tree_b = commit.tree()?;
-                let empty_tree_id = Oid::zero();
-                let empty_tree = repo.find_tree(empty_tree_id).ok();
-
-                let mut diff = repo.diff_tree_to_tree(empty_tree.as_ref(), Some(&tree_b), None)?;
-                self.process_diff(&mut diff, &subdir_pattern, &mut changes)?;
-            }
+        let mut revwalk = repo.revwalk()?;
+        revwalk.push_range(&format!("{}..{}", range_start, end_oid))?;
+        if first_parent {
+            revwalk.simplify_first_parent()?;
         }
+        revwalk.set_sorting(git2::Sort::REVERSE | git2::Sort::TIME)?;
 
-        // Handle root commit inclusion
-        if include_start_changes && start_commit_obj.parents().len() == 0 {
-            let tree_b = start_commit_obj.tree()?;
-            let empty_tree_id = Oid::zero();
-            let empty_tree = repo.find_tree(empty_tree_id).ok();
+        let mut commit_infos = Vec::new();
 
-            let mut diff = repo.diff_tree_to_tree(empty_tree.as_ref(), Some(&tree_b), None)?;
-            self.process_diff(&mut diff, &subdir_pattern, &mut changes)?;
-        }
-
-        // Remove duplicates and sort
-        let mut seen_paths = HashSet::new();
-        changes.retain(|change| {
-            if seen_paths.contains(&change.path) {
-                false
-            } else {
-                seen_paths.insert(change.path.clone());
+        for id in revwalk {
+            let id = id?;
+            let commit = repo.find_commit(id)?;
+            
+            // Check if commit affects the subdirectory
+            let affects = if subdir.is_empty() || subdir == "." {
                 true
-            }
-        });
+            } else {
+                self.commit_affects_subdir(&commit, subdir)?
+            };
 
-        Ok(changes)
+            if affects {
+                commit_infos.push(CommitInfo {
+                    id: id.to_string(),
+                    subject: commit.summary().unwrap_or("No subject").to_string(),
+                    author: commit.author().name().unwrap_or("Unknown").to_string(),
+                    date: chrono::DateTime::<chrono::Utc>::from_timestamp(commit.time().seconds(), 0)
+                        .unwrap_or_default()
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                    is_merge: commit.parents().len() > 1,
+                });
+            }
+        }
+
+        Ok(commit_infos)
     }
 
-    fn process_diff(&self, diff: &mut Diff, subdir_pattern: &str, changes: &mut Vec<FileChange>) -> Result<()> {
-        diff.foreach(
-            &mut |delta: DiffDelta, _progress| {
-                let new_path = delta.new_file().path()
-                    .and_then(|p| p.to_str())
-                    .unwrap_or("");
+    pub fn create_patch_file(&self, commit_id: &str, subdir: &str, output_dir: &Path) -> Result<PathBuf> {
+        let repo_path = &self.source_repo_info.path;
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .arg("format-patch")
+            .arg("-1")
+            .arg(commit_id)
+            .arg("--binary")
+            .arg("--full-index")
+            .arg(format!("--relative={}", subdir))
+            .arg("-o")
+            .arg(output_dir)
+            .output()
+            .with_context(|| "Failed to run git format-patch")?;
 
-                let old_path = delta.old_file().path()
-                    .and_then(|p| p.to_str())
-                    .unwrap_or("");
+        if !output.status.success() {
+            return Err(anyhow!("git format-patch failed: {}", String::from_utf8_lossy(&output.stderr)));
+        }
 
-                // Check if either path is in the subdirectory
-                let in_subdir = new_path.starts_with(subdir_pattern) || old_path.starts_with(subdir_pattern);
+        let patch_file_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if patch_file_name.is_empty() {
+             // Sometimes format-patch outputs nothing to stdout if -o is used, 
+             // we need to find the file in output_dir
+             let entries = std::fs::read_dir(output_dir)?;
+             for entry in entries {
+                 let entry = entry?;
+                 return Ok(entry.path());
+             }
+             return Err(anyhow!("No patch file generated"));
+        }
+        
+        Ok(output_dir.join(patch_file_name))
+    }
 
-                if in_subdir {
-                    let (path, status) = match delta.status() {
-                        git2::Delta::Added => {
-                            (new_path.to_string(), FileStatus::Added)
-                        }
-                        git2::Delta::Deleted => {
-                            (old_path.to_string(), FileStatus::Deleted)
-                        }
-                        git2::Delta::Modified => {
-                            (new_path.to_string(), FileStatus::Modified)
-                        }
-                        git2::Delta::Renamed => {
-                            let change = FileChange {
-                                path: new_path.to_string(),
-                                status: FileStatus::Renamed,
-                                old_path: Some(old_path.to_string()),
-                            };
-                            changes.push(change);
-                            return true;
-                        }
-                        git2::Delta::Typechange => {
-                            (new_path.to_string(), FileStatus::TypeChanged)
-                        }
-                        _ => return true, // Ignore other types
-                    };
+    pub fn apply_patch_file(&self, patch_path: &Path, target_subdir: Option<&str>) -> Result<()> {
+        let repo_path = &self.target_repo_info.path;
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(repo_path).arg("am");
+        
+        cmd.arg("--3way").arg("--committer-date-is-author-date");
+        
+        if let Some(subdir) = target_subdir {
+            cmd.arg(format!("--directory={}", subdir));
+        }
+        
+        cmd.arg(patch_path);
 
-                    changes.push(FileChange {
-                        path,
-                        status,
-                        old_path: None,
-                    });
-                }
-                true
-            },
-            None,
-            None,
-            None,
-        )?;
+        let output = cmd.output().with_context(|| "Failed to run git am")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("patch does not have a valid index") || stderr.contains("Patch is empty") {
+                return Err(anyhow!("EMPTY_PATCH"));
+            }
+            return Err(anyhow!("CONFLICT: {}", stderr));
+        }
 
         Ok(())
     }
+
+    pub fn abort_patch_apply(&self) -> Result<()> {
+        let repo_path = &self.target_repo_info.path;
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .arg("am")
+            .arg("--abort")
+            .output()
+            .with_context(|| "Failed to run git am --abort")?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("No am session in progress") {
+                return Err(anyhow!("git am --abort failed: {}", stderr));
+            }
+        }
+        Ok(())
+    }
+
 
     #[allow(dead_code)]
     pub fn get_commit_count(&self, subdir: &str, start_commit: &str, end_commit: &str, _exclude_merges: bool) -> Result<(usize, usize)> {
@@ -387,7 +363,7 @@ impl GitManager {
             let subdir_pattern = format!("{}/", subdir.trim_end_matches('/'));
 
             let mut affects_subdir = false;
-            diff.foreach(
+            let result = diff.foreach(
                 &mut |delta: DiffDelta, _progress| {
                     let new_path = delta.new_file().path()
                         .and_then(|p| p.to_str())
@@ -406,26 +382,27 @@ impl GitManager {
                 None,
                 None,
                 None,
-            )?;
+            );
 
-            Ok(affects_subdir)
+            match result {
+                Ok(_) => Ok(affects_subdir),
+                Err(e) if e.code() == git2::ErrorCode::User => Ok(affects_subdir),
+                Err(e) => Err(anyhow::Error::from(e)).context("Failed to iterate diff"),
+            }
         } else {
             // Initial commit, check if it contains files in the subdirectory
             let tree_b = commit.tree()?;
-            let empty_tree_id = Oid::zero();
-            let empty_tree = repo.find_tree(empty_tree_id).ok();
-
-            let diff = repo.diff_tree_to_tree(empty_tree.as_ref(), Some(&tree_b), None)?;
+            let diff = repo.diff_tree_to_tree(None, Some(&tree_b), None)?;
             let subdir_pattern = format!("{}/", subdir.trim_end_matches('/'));
 
             let mut affects_subdir = false;
-            diff.foreach(
+            let result = diff.foreach(
                 &mut |delta: DiffDelta, _progress| {
                     let new_path = delta.new_file().path()
                         .and_then(|p| p.to_str())
                         .unwrap_or("");
 
-                    if new_path.starts_with(&subdir_pattern) {
+                    if new_path.starts_with(&subdir_pattern) || new_path == subdir {
                         affects_subdir = true;
                         return false; // Stop iteration
                     }
@@ -434,25 +411,36 @@ impl GitManager {
                 None,
                 None,
                 None,
-            )?;
+            );
 
-            Ok(affects_subdir)
+            match result {
+                Ok(_) => Ok(affects_subdir),
+                Err(e) if e.code() == git2::ErrorCode::User => Ok(affects_subdir),
+                Err(e) => Err(anyhow::Error::from(e)).context("Failed to iterate initial diff"),
+            }
         }
     }
 
     pub fn restore_original_branches(&mut self) -> Result<()> {
+        // First try to abort any pending git am to unlock the repo
+        let _ = self.abort_patch_apply();
+
         // Store the original branch names to avoid borrowing issues
         let source_original = self.source_repo_info.original_branch.clone();
         let target_original = self.target_repo_info.original_branch.clone();
 
         // Restore source repository
         if self.source_repo_info.current_branch != source_original {
-            self.switch_branch(true, &source_original)?;
+            if let Err(e) = self.switch_branch(true, &source_original) {
+                tracing::error!("Failed to restore source branch: {}", e);
+            }
         }
 
         // Restore target repository
         if self.target_repo_info.current_branch != target_original {
-            self.switch_branch(false, &target_original)?;
+            if let Err(e) = self.switch_branch(false, &target_original) {
+                tracing::error!("Failed to restore target branch: {}", e);
+            }
         }
 
         Ok(())
