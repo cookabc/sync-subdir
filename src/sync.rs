@@ -1,14 +1,25 @@
-use anyhow::{anyhow, Context, Result};
-use std::path::{PathBuf};
+use crate::error::{SyncError, Result};
 use crate::git::{CommitInfo, GitManager};
 use tokio::time::{sleep, Duration};
+use tokio::sync::mpsc::UnboundedSender;
 use tempfile::tempdir;
+
+#[derive(Debug, Clone)]
+pub enum SyncEvent {
+    Progress {
+        current: usize,
+        total: usize,
+        subject: String,
+        status: String,
+    },
+    Completed(SyncStats),
+    Error(String),
+}
 
 #[derive(Debug, Clone)]
 pub struct SyncStats {
     pub total_commits: usize,
     pub synced_commits: usize,
-    pub failed_commits: usize,
     pub skipped_commits: usize,
 }
 
@@ -17,7 +28,6 @@ impl Default for SyncStats {
         Self {
             total_commits: 0,
             synced_commits: 0,
-            failed_commits: 0,
             skipped_commits: 0,
         }
     }
@@ -30,8 +40,6 @@ pub struct SyncEngine {
 
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
-    pub source_repo: PathBuf,
-    pub target_repo: PathBuf,
     pub subdir: String,
 }
 
@@ -43,23 +51,21 @@ impl SyncEngine {
         }
     }
 
-    pub async fn sync_commits<F>(
+    pub async fn sync_commits(
         &mut self, 
         git_manager: &GitManager,
         commits: &[CommitInfo], 
-        mut progress_callback: F
-    ) -> Result<SyncStats>
-    where
-        F: FnMut(usize, usize, &str, &str), // current, total, subject, status
-    {
+        tx: UnboundedSender<SyncEvent>,
+    ) -> Result<SyncStats> {
         let mut stats = SyncStats::default();
         stats.total_commits = commits.len();
 
         if stats.total_commits == 0 {
+            let _ = tx.send(SyncEvent::Completed(stats.clone()));
             return Ok(stats);
         }
 
-        let tmp_dir = tempdir().context("Failed to create temp directory for patches")?;
+        let tmp_dir = tempdir().map_err(|e| SyncError::Io(e))?;
 
         for (i, commit) in commits.iter().enumerate() {
             let status = if self.dry_run {
@@ -75,37 +81,37 @@ impl SyncEngine {
                                 stats.synced_commits += 1;
                                 "OK"
                             }
-                            Err(e) if e.to_string() == "EMPTY_PATCH" => {
+                            Err(SyncError::EmptyPatch) => {
                                 stats.skipped_commits += 1;
                                 "EMPTY (SKIPPED)"
                             }
                             Err(e) => {
-                                return Err(anyhow!("同步提交失败 {}: {}", commit.id, e));
+                                let err_msg = format!("同步提交失败 {}: {}", commit.id, e);
+                                let _ = tx.send(SyncEvent::Error(err_msg));
+                                return Err(e);
                             }
                         }
                     }
                     Err(e) => {
-                        return Err(anyhow!("生成补丁失败 {}: {}", commit.id, e));
+                        let err_msg = format!("生成补丁失败 {}: {}", commit.id, e);
+                        let _ = tx.send(SyncEvent::Error(err_msg));
+                        return Err(e);
                     }
                 }
             };
 
-            progress_callback(i + 1, stats.total_commits, &commit.subject, status);
+            let _ = tx.send(SyncEvent::Progress {
+                current: i + 1,
+                total: stats.total_commits,
+                subject: commit.subject.clone(),
+                status: status.to_string(),
+            });
 
-            // Small delay for UI updates
-            sleep(Duration::from_millis(50)).await;
+            // Small delay for UI updates (reduced from 50ms to 20ms for better responsiveness)
+            sleep(Duration::from_millis(20)).await;
         }
 
+        let _ = tx.send(SyncEvent::Completed(stats.clone()));
         Ok(stats)
-    }
-
-    pub fn validate_paths(&self) -> Result<()> {
-        if !self.config.source_repo.exists() {
-            return Err(anyhow!("Source repository does not exist: {}", self.config.source_repo.display()));
-        }
-        if !self.config.target_repo.exists() {
-            return Err(anyhow!("Target repository does not exist: {}", self.config.target_repo.display()));
-        }
-        Ok(())
     }
 }
