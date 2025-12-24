@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use crate::cli::Config;
 use crate::git::CommitInfo;
+use crate::sync::{SyncStats};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppState {
@@ -57,6 +58,7 @@ pub struct App {
     pub start_time: Instant,
     pub end_time: Option<Instant>,
     pub loaded_changes: bool,
+    pub sync_stats: Option<SyncStats>,
 }
 
 impl App {
@@ -76,6 +78,7 @@ impl App {
             start_time: Instant::now(),
             end_time: None,
             loaded_changes: false,
+            sync_stats: None,
         }
     }
 
@@ -451,14 +454,6 @@ impl TuiManager {
         }
     }
 
-    pub fn handle_events(&self) -> Result<KeyCode> {
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(KeyEvent { code, .. }) = event::read()? {
-                return Ok(code);
-            }
-        }
-        Ok(KeyCode::Null)
-    }
 }
 
 impl Drop for TuiManager {
