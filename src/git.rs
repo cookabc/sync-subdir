@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Context, Result};
-use tracing::debug;
-use git2::{Repository, StatusOptions, Commit, DiffDelta};
+use crate::error::{SyncError, Result};
+use tracing::{debug, error};
+use git2::{Repository, StatusOptions, Commit, DiffDelta, Signature};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -24,12 +24,73 @@ pub struct GitManager {
     pub target_repo_info: RepoInfo,
 }
 
+/// RAII guard to ensure stash is popped when dropped
+pub struct StashGuard<'a> {
+    repo: Repository,
+    is_active: bool,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> StashGuard<'a> {
+    pub fn new(repo: Repository) -> Self {
+        Self {
+            repo,
+            is_active: true,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a> Drop for StashGuard<'a> {
+    fn drop(&mut self) {
+        if self.is_active {
+            debug!("StashGuard: Popping stash automatically");
+            if let Err(e) = self.repo.stash_pop(0, None) {
+                error!("Failed to pop stash in drop: {}", e);
+            }
+        }
+    }
+}
+
+/// RAII guard to ensure branch is restored when dropped
+pub struct BranchGuard {
+    repo_path: PathBuf,
+    original_branch: String,
+    is_active: bool,
+}
+
+impl BranchGuard {
+    pub fn new(repo_path: PathBuf, _is_source: bool, original_branch: String) -> Self {
+        Self {
+            repo_path,
+            original_branch,
+            is_active: true,
+        }
+    }
+}
+
+impl Drop for BranchGuard {
+    fn drop(&mut self) {
+        if self.is_active {
+            debug!("BranchGuard: Restoring branch {}", self.original_branch);
+            if let Ok(repo) = Repository::open(&self.repo_path) {
+                let branch_ref = format!("refs/heads/{}", self.original_branch);
+                if let Err(e) = repo.set_head(&branch_ref) {
+                    error!("Failed to restore branch {} in drop: {}", self.original_branch, e);
+                }
+            } else {
+                error!("Failed to open repository in BranchGuard drop");
+            }
+        }
+    }
+}
+
 impl GitManager {
     pub fn new(source_path: &Path, target_path: &Path) -> Result<Self> {
         let source_repo = Repository::open(source_path)
-            .with_context(|| format!("Failed to open source repository: {}", source_path.display()))?;
+            .map_err(|_| SyncError::NotARepository(source_path.to_path_buf()))?;
         let target_repo = Repository::open(target_path)
-            .with_context(|| format!("Failed to open target repository: {}", target_path.display()))?;
+            .map_err(|_| SyncError::NotARepository(target_path.to_path_buf()))?;
 
         let source_current_branch = Self::get_current_branch(&source_repo)?;
         let target_current_branch = Self::get_current_branch(&target_repo)?;
@@ -54,19 +115,17 @@ impl GitManager {
         } else {
             &self.target_repo_info.path
         };
-        Repository::open(path).with_context(|| format!("Failed to open repository: {}", path.display()))
+        Repository::open(path).map_err(|e| e.into())
     }
 
     fn get_current_branch(repo: &Repository) -> Result<String> {
-        let head = repo.head()
-            .with_context(|| "Failed to get repository HEAD")?;
+        let head = repo.head()?;
 
         if let Some(name) = head.shorthand() {
             Ok(name.to_string())
         } else {
             // Detached HEAD, get commit hash
-            let commit = head.peel_to_commit()
-                .with_context(|| "Failed to peel HEAD to commit")?;
+            let commit = head.peel_to_commit()?;
             Ok(format!("detached-{}", commit.id()))
         }
     }
@@ -77,12 +136,11 @@ impl GitManager {
 
         // Check if branch exists
         let _branch_oid = repo.revparse_single(&branch_ref)
-            .with_context(|| format!("Branch '{}' does not exist", branch_name))?
+            .map_err(|_| SyncError::BranchNotFound(branch_name.to_string()))?
             .id();
 
         // Checkout the branch
-        repo.set_head(&branch_ref)
-            .with_context(|| format!("Failed to set HEAD to branch: {}", branch_name))?;
+        repo.set_head(&branch_ref)?;
 
         // Update current branch info
         if is_source {
@@ -96,17 +154,13 @@ impl GitManager {
 
     pub fn create_branch(&mut self, is_target: bool, branch_name: &str) -> Result<()> {
         let repo = self.get_repository(is_target)?;
-        let head = repo.head()
-            .with_context(|| "Failed to get repository HEAD")?;
-        let head_commit = head.peel_to_commit()
-            .with_context(|| "Failed to peel HEAD to commit")?;
+        let head = repo.head()?;
+        let head_commit = head.peel_to_commit()?;
 
-        let _branch = repo.branch(branch_name, &head_commit, false)
-            .with_context(|| format!("Failed to create branch: {}", branch_name))?;
+        let _branch = repo.branch(branch_name, &head_commit, false)?;
 
         // Checkout the new branch
-        repo.set_head(&format!("refs/heads/{}", branch_name))
-            .with_context(|| format!("Failed to set HEAD to new branch: {}", branch_name))?;
+        repo.set_head(&format!("refs/heads/{}", branch_name))?;
 
         if is_target {
             self.target_repo_info.current_branch = branch_name.to_string();
@@ -120,8 +174,7 @@ impl GitManager {
         let mut status_options = StatusOptions::new();
         status_options.include_untracked(true);
 
-        let statuses = repo.statuses(Some(&mut status_options))
-            .with_context(|| "Failed to get repository status")?;
+        let statuses = repo.statuses(Some(&mut status_options))?;
 
         Ok(!statuses.is_empty())
     }
@@ -131,8 +184,7 @@ impl GitManager {
 
         // Get current signature
         let signature = repo.signature()
-            .or_else(|_| git2::Signature::now("sync-subdir", "sync-subdir@example.com"))
-            .with_context(|| "Failed to create git signature")?;
+            .unwrap_or_else(|_| Signature::now("sync-subdir", "sync-subdir@example.com").unwrap());
 
         // Stash changes
         match repo.stash_save(&signature, message, None) {
@@ -141,21 +193,15 @@ impl GitManager {
                 debug!("Nothing to stash in {} repo", if is_target { "target" } else { "source" });
                 Ok(())
             }
-            Err(e) => Err(anyhow::Error::from(e)).context("Failed to stash changes"),
+            Err(e) => Err(SyncError::Git(e)),
         }
     }
 
-    pub fn pop_stash(&self, is_target: bool) -> Result<()> {
-        let mut repo = self.get_repository(is_target)?;
-        repo.stash_pop(0, None)
-            .with_context(|| "Failed to pop stash")?;
-        Ok(())
-    }
 
     pub fn validate_commit(&self, is_source: bool, commit_hash: &str) -> Result<()> {
         let repo = self.get_repository(is_source)?;
         repo.revparse_single(commit_hash)
-            .with_context(|| format!("Invalid commit hash: {}", commit_hash))?;
+            .map_err(|_| SyncError::InvalidCommit(commit_hash.to_string()))?;
         Ok(())
     }
 
@@ -172,9 +218,9 @@ impl GitManager {
         let repo = self.get_repository(true)?;
 
         let start_obj = repo.revparse_single(start_commit)
-            .with_context(|| format!("Invalid start commit: {}", start_commit))?;
+            .map_err(|_| SyncError::InvalidCommit(start_commit.to_string()))?;
         let end_obj = repo.revparse_single(end_commit)
-            .with_context(|| format!("Invalid end commit: {}", end_commit))?;
+            .map_err(|_| SyncError::InvalidCommit(end_commit.to_string()))?;
 
         let start_oid = start_obj.id();
         let end_oid = end_obj.id();
@@ -242,11 +288,10 @@ impl GitManager {
             .arg(format!("--relative={}", subdir))
             .arg("-o")
             .arg(output_dir)
-            .output()
-            .with_context(|| "Failed to run git format-patch")?;
+            .output()?;
 
         if !output.status.success() {
-            return Err(anyhow!("git format-patch failed: {}", String::from_utf8_lossy(&output.stderr)));
+            return Err(SyncError::PatchGenerationFailed(String::from_utf8_lossy(&output.stderr).to_string()));
         }
 
         let patch_file_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -258,7 +303,7 @@ impl GitManager {
                  let entry = entry?;
                  return Ok(entry.path());
              }
-             return Err(anyhow!("No patch file generated"));
+             return Err(SyncError::PatchGenerationFailed("No patch file generated".to_string()));
         }
         
         Ok(output_dir.join(patch_file_name))
@@ -277,35 +322,16 @@ impl GitManager {
         
         cmd.arg(patch_path);
 
-        let output = cmd.output().with_context(|| "Failed to run git am")?;
+        let output = cmd.output()?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if stderr.contains("patch does not have a valid index") || stderr.contains("Patch is empty") {
-                return Err(anyhow!("EMPTY_PATCH"));
+                return Err(SyncError::EmptyPatch);
             }
-            return Err(anyhow!("CONFLICT: {}", stderr));
+            return Err(SyncError::PatchConflict(stderr.to_string()));
         }
 
-        Ok(())
-    }
-
-    pub fn abort_patch_apply(&self) -> Result<()> {
-        let repo_path = &self.target_repo_info.path;
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo_path)
-            .arg("am")
-            .arg("--abort")
-            .output()
-            .with_context(|| "Failed to run git am --abort")?;
-        
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("No am session in progress") {
-                return Err(anyhow!("git am --abort failed: {}", stderr));
-            }
-        }
         Ok(())
     }
 
@@ -316,25 +342,22 @@ impl GitManager {
 
         // Resolve commit references (supports both OIDs and references like HEAD)
         let start_obj = repo.revparse_single(start_commit)
-            .with_context(|| format!("Invalid start commit: {}", start_commit))?;
+            .map_err(|_| SyncError::InvalidCommit(start_commit.to_string()))?;
         let end_obj = repo.revparse_single(end_commit)
-            .with_context(|| format!("Invalid end commit: {}", end_commit))?;
+            .map_err(|_| SyncError::InvalidCommit(end_commit.to_string()))?;
 
         let _start_oid = start_obj.id();
         let _end_oid = end_obj.id();
 
-        let mut revwalk = repo.revwalk()
-            .with_context(|| "Failed to create revwalk")?;
-        revwalk.push_range(&format!("{}..{}", start_commit, end_commit))
-            .with_context(|| "Failed to set commit range")?;
+        let mut revwalk = repo.revwalk()?;
+        revwalk.push_range(&format!("{}..{}", start_commit, end_commit))?;
 
         let mut total_commits = 0;
         let mut merge_commits = 0;
 
         for id in revwalk {
-            let id = id.with_context(|| "Failed to get commit ID from revwalk")?;
-            let commit = repo.find_commit(id)
-                .with_context(|| "Failed to find commit")?;
+            let id = id?;
+            let commit = repo.find_commit(id)?;
 
             // Check if commit affects the subdirectory
             let affects_subdir = self.commit_affects_subdir(&commit, subdir)?;
@@ -387,7 +410,7 @@ impl GitManager {
             match result {
                 Ok(_) => Ok(affects_subdir),
                 Err(e) if e.code() == git2::ErrorCode::User => Ok(affects_subdir),
-                Err(e) => Err(anyhow::Error::from(e)).context("Failed to iterate diff"),
+                Err(e) => Err(e.into()),
             }
         } else {
             // Initial commit, check if it contains files in the subdirectory
@@ -416,33 +439,8 @@ impl GitManager {
             match result {
                 Ok(_) => Ok(affects_subdir),
                 Err(e) if e.code() == git2::ErrorCode::User => Ok(affects_subdir),
-                Err(e) => Err(anyhow::Error::from(e)).context("Failed to iterate initial diff"),
+                Err(e) => Err(e.into()),
             }
         }
-    }
-
-    pub fn restore_original_branches(&mut self) -> Result<()> {
-        // First try to abort any pending git am to unlock the repo
-        let _ = self.abort_patch_apply();
-
-        // Store the original branch names to avoid borrowing issues
-        let source_original = self.source_repo_info.original_branch.clone();
-        let target_original = self.target_repo_info.original_branch.clone();
-
-        // Restore source repository
-        if self.source_repo_info.current_branch != source_original {
-            if let Err(e) = self.switch_branch(true, &source_original) {
-                tracing::error!("Failed to restore source branch: {}", e);
-            }
-        }
-
-        // Restore target repository
-        if self.target_repo_info.current_branch != target_original {
-            if let Err(e) = self.switch_branch(false, &target_original) {
-                tracing::error!("Failed to restore target branch: {}", e);
-            }
-        }
-
-        Ok(())
     }
 }
